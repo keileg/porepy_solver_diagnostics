@@ -165,11 +165,18 @@ class PetscDirectSolver(pp.solvers.LinearSolverBase):
         try:
             ksp.setUp()
             ksp.solve(rhs, solution)
+            values = solution.getArray().copy()
         except PETSc.Error as error:
             return np.zeros_like(linear_system.rhs), (
                 pp.solvers.LinearSolverStatusFailure(reason=str(error))
             )
-        return solution.getArray().copy(), pp.solvers.LinearSolverStatusSuccess(
+        finally:
+            # PETSc objects outlive their Python handles, and one factorisation of this
+            # system is a gigabyte or so: without this, a run accumulates one per
+            # nonlinear iteration.
+            for petsc_object in (ksp, petsc_matrix, rhs, solution):
+                petsc_object.destroy()
+        return values, pp.solvers.LinearSolverStatusSuccess(
             solve_time=time.time() - t_0
         )
 

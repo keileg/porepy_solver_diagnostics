@@ -60,7 +60,11 @@ def build_specs(arguments: argparse.Namespace) -> tuple[CaseSpec, SolverSpec]:
 
 def main() -> None:
     """Run one case and print its outcome."""
-    logging.basicConfig(level=logging.INFO, force=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        force=True,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     arguments = parse_arguments()
     case, solver = build_specs(arguments)
     directory = arguments.results / f"{case.case_id}__{solver.solver_id}"
