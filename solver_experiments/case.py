@@ -48,6 +48,11 @@ class CaseSpec:
             keep; 3 stops one hour after the well opens, 5 runs the full 100 days.
         end_time_fraction: Fraction of the final schedule interval to actually run.
             Present because the last interval dominates the cost of a full run.
+        injection_ramp_steps: Number of equal sub-intervals the time stepper must stop
+            at while the well opens. 1 (the default) is the shipped behaviour, where the
+            whole hour between well opening and the first pressure target is a single
+            time step. Sub-intervals are equal rather than geometrically graded, since a
+            graded ramp would violate `SolverSpec.dt_min` (0.1 h) at once.
 
     """
 
@@ -59,6 +64,7 @@ class CaseSpec:
     cell_size_fracture: float | None = None
     schedule_length: int = 5
     end_time_fraction: float = 1.0
+    injection_ramp_steps: int = 1
 
     @property
     def case_id(self) -> str:
@@ -136,8 +142,9 @@ def build_model_params(case: CaseSpec, solver: SolverSpec, folder_name: str) -> 
         params["meshing_arguments"]["cell_size"] = case.cell_size
     if case.cell_size_fracture is not None:
         params["meshing_arguments"]["cell_size_fracture"] = case.cell_size_fracture
-    params["injection_well_pressures"] = _scaled_injection_pressures(case, params)
-    params["time_manager"] = _time_manager(case, solver, params)
+    schedule, pressures = _schedule_and_pressures(case, params)
+    params["injection_well_pressures"] = pressures
+    params["time_manager"] = _time_manager(solver, params, schedule)
     return params
 
 
@@ -147,7 +154,37 @@ def _set_solid_value(params: dict, name: str, value: float) -> None:
     params["material_constants"]["solid"] = replace(solid, **{name: value})
 
 
-def _scaled_injection_pressures(case: CaseSpec, params: dict) -> list[float]:
+def _schedule_and_pressures(
+    case: CaseSpec, params: dict
+) -> tuple[np.ndarray, list[float]]:
+    """Return the time schedule and the matching well pressure protocol.
+
+    The two are built together because the protocol carries one value per schedule
+    point: inserting ramp points means interpolating the protocol onto them.
+    Interpolating rather than inventing values keeps the pressure the well sees at any
+    given time exactly as shipped, so a ramped run differs from the baseline only in
+    where the time stepper is forced to stop.
+
+    """
+    times = _shipped_times(case, params)
+    pressures = _scaled_pressures(case, params)
+    times, pressures = _with_ramp_points(case, times, pressures)
+    if case.end_time_fraction < 1.0:
+        times = times.copy()
+        times[-1] = times[-2] + case.end_time_fraction * (times[-1] - times[-2])
+        pressures = _interpolated(
+            times, _shipped_times(case, params), _scaled_pressures(case, params)
+        )
+    return times, pressures
+
+
+def _shipped_times(case: CaseSpec, params: dict) -> np.ndarray:
+    """The shipped schedule, truncated to the requested number of points."""
+    schedule = params["time_manager"].schedule.get_array()
+    return np.asarray(schedule, dtype=float)[: case.schedule_length]
+
+
+def _scaled_pressures(case: CaseSpec, params: dict) -> list[float]:
     """Scale the injection-phase entries of the well pressure protocol.
 
     The first two entries drive the closed-well initialisation and are left alone: the
@@ -162,15 +199,34 @@ def _scaled_injection_pressures(case: CaseSpec, params: dict) -> list[float]:
     ]
 
 
-def _time_manager(case: CaseSpec, solver: SolverSpec, params: dict) -> pp.TimeManager:
-    """Build the time manager for a possibly shortened schedule."""
+def _with_ramp_points(
+    case: CaseSpec, times: np.ndarray, pressures: list[float]
+) -> tuple[np.ndarray, list[float]]:
+    """Subdivide the interval in which the well opens into equal sub-intervals.
+
+    The well is held closed until the second schedule point, so the interval that
+    follows it is the one carrying the opening.
+
+    """
+    if case.injection_ramp_steps <= 1 or times.size < 3:
+        return times, pressures
+    interior = np.linspace(times[1], times[2], case.injection_ramp_steps + 1)[1:-1]
+    ramped = np.concatenate([times[:2], interior, times[2:]])
+    return ramped, _interpolated(ramped, times, pressures)
+
+
+def _interpolated(
+    new_times: np.ndarray, times: np.ndarray, pressures: list[float]
+) -> list[float]:
+    """Sample a well pressure protocol at new time points."""
+    return [float(value) for value in np.interp(new_times, times, pressures)]
+
+
+def _time_manager(
+    solver: SolverSpec, params: dict, schedule: np.ndarray
+) -> pp.TimeManager:
+    """Build the time manager for a given schedule, keeping the shipped adaptivity."""
     shipped = params["time_manager"]
-    schedule = np.asarray(shipped.schedule.get_array())[: case.schedule_length]
-    if case.end_time_fraction < 1.0:
-        schedule = schedule.copy()
-        schedule[-1] = schedule[-2] + case.end_time_fraction * (
-            schedule[-1] - schedule[-2]
-        )
     return pp.TimeManager(
         schedule=schedule,
         dt_init=shipped.dt_init,

@@ -27,6 +27,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--cell-size-fracture", type=float)
     parser.add_argument("--schedule-length", type=int)
     parser.add_argument("--end-time-fraction", type=float)
+    parser.add_argument("--injection-ramp-steps", type=int)
     parser.add_argument("--linear-backend")
     parser.add_argument("--row-equilibration", action="store_true")
     parser.add_argument("--nonlinear-solver")

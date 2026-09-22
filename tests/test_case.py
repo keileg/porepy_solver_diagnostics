@@ -106,3 +106,41 @@ def test_dt_min_reaches_the_time_manager():
         CaseSpec(), SolverSpec(dt_min=60.0), folder_name="unused"
     )
     assert parameters["time_manager"].dt_min_max[0] == pytest.approx(60.0)
+
+
+def test_ramping_the_well_opening_only_adds_stopping_points(shipped):
+    """A ramped run must see the same pressure-versus-time as the shipped one.
+
+    The ramp exists to force the stepper to stop more often while the well opens. If
+    it also changed the protocol, a difference in solver behaviour could not be
+    attributed to the time stepping.
+
+    """
+    ramped = build_model_params(
+        CaseSpec(schedule_length=3, injection_ramp_steps=4),
+        SolverSpec(),
+        folder_name="unused",
+    )
+    times = ramped["time_manager"].schedule.get_array()
+    original = shipped["time_manager"].schedule.get_array()[:3]
+    assert len(times) == 6
+    assert np.allclose(np.asarray(times)[[0, 1, -1]], original)
+    # Equal sub-intervals over the opening hour, each above the default dt_min.
+    opening = np.diff(np.asarray(times)[1:])
+    assert np.allclose(opening, opening[0])
+    assert opening[0] > SolverSpec().dt_min
+
+    pressures = ramped["injection_well_pressures"]
+    expected = np.interp(times, original, shipped["injection_well_pressures"][:3])
+    assert np.allclose(pressures, expected)
+
+
+def test_no_ramp_leaves_the_schedule_alone(shipped):
+    """`injection_ramp_steps=1` must be exactly the shipped schedule."""
+    unramped = build_model_params(
+        CaseSpec(injection_ramp_steps=1), SolverSpec(), folder_name="unused"
+    )
+    assert np.allclose(
+        unramped["time_manager"].schedule.get_array(),
+        shipped["time_manager"].schedule.get_array(),
+    )
