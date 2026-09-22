@@ -48,16 +48,17 @@ failure can be attributed to the step that caused it.
 
 ## Environment notes
 
-* The linear solver matters more than usual here, and it cannot be judged by
-  `||Ax-b||/||b||`: the assembled system's rows span twenty orders of magnitude, so that
-  number reports only on the worst-scaled block. Worse, the Jacobian is numerically
-  singular — a fracture-intersection temperature whose column is twelve orders below the
-  matrix norm — so a factorisation can return an enormous component along a direction the
-  system does not determine, while leaving the residual small. SuperLU does exactly that.
-  Every solve is therefore scored on two fields, `max_backward_error` and
-  `max_update_norm`, and both must look sane before a run's results mean anything. Run
-  with `--linear-backend pypardiso --row-equilibration`, which agrees with PETSc's MUMPS
-  and UMFPACK to 2e-10 and is seven times faster than SuperLU.
+* The linear solver cannot be judged by `||Ax-b||/||b||`: the assembled system's rows span
+  twenty orders of magnitude, so that number reports only on the worst-scaled block. Every
+  solve is therefore scored on `max_backward_error` and `max_update_norm`, and both must
+  look sane before a run's results mean anything.
+* **Compare backends with those per-solve numbers, from inside a run.** A Jacobian dumped
+  by calling `prepare_simulation()` and then `assemble()` is not one the nonlinear loop
+  solves — the loop assembles after `before_nonlinear_iteration` — and on this case such a
+  matrix is numerically singular and ranks the backends in the wrong order. Measured
+  in-run, `scipy_sparse` (SuperLU) and the default `pypardiso` produce the identical
+  nonlinear trajectory, with SuperLU six orders more accurate per solve and six times
+  slower. Row equilibration is available but is not worth it in-run.
 * `pp_solvers` (the PETSc bridge, for iterative solvers) needs `scikit-learn` installed;
   its `solver_selection` subpackage imports it at module level.
 
