@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+results/
+reports/*.html
+*.log
+*.msh
+*.geo_unrolled
+*.geo_unrolled.xao
+*.vtu
+*.pvd
