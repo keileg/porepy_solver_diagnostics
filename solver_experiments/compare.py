@@ -22,7 +22,8 @@ COLUMNS: list[tuple[str, str]] = [
     ("waste", "{wasted_fraction:.2f}"),
     ("it/step", "{iterations_per_step}"),
     ("lin_s", "{linear_solve_time:.0f}"),
-    ("max_lin_res", "{max_relative_residual:.1e}"),
+    ("max_bwd_err", "{max_backward_error:.1e}"),
+    ("max_|dx|", "{max_update_norm:.1e}"),
     ("slip", "{max_slip}"),
     ("open", "{max_open}"),
     ("cycl", "{num_iterations_cycling}"),
@@ -56,8 +57,11 @@ def flatten(metrics: dict[str, Any]) -> dict[str, Any]:
         "wasted_fraction": metrics["iterations"].get("wasted_fraction", 0.0),
         "iterations_per_step": _format_spread(per_step),
         "linear_solve_time": metrics["timing"]["linear_solve_time"],
-        "max_relative_residual": metrics["linear_solver"].get(
-            "max_relative_residual", float("nan")
+        "max_backward_error": metrics["linear_solver"].get(
+            "max_backward_error", float("nan")
+        ),
+        "max_update_norm": metrics["linear_solver"].get(
+            "max_update_norm", float("nan")
         ),
         "max_slip": contact.get("max_slip", "-"),
         "max_open": contact.get("max_open", "-"),

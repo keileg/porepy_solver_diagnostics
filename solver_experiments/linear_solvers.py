@@ -11,9 +11,19 @@ backend. Two additions are needed here:
 * :class:`PetscDirectSolver` reaches the MUMPS and UMFPACK factorisations built into
   the local PETSc, which are both faster than SuperLU on these systems.
 
-:class:`InstrumentedSolver` wraps any of them and records the true relative residual
-of every solve, so a backend that returns a wrong answer cannot be mistaken for a
-nonlinear-solver failure.
+:class:`InstrumentedSolver` wraps any of them and records how trustworthy every solve
+was, so a backend that returns a wrong answer cannot be mistaken for a nonlinear-solver
+failure. Two numbers are needed for that, because no single one suffices on this system:
+
+* a *backward error*, the residual of each equation measured against the size of the
+  terms that form it. The plain relative residual ``||Ax-b|| / ||b||`` is useless here,
+  since a system whose rows span twenty orders of magnitude lets a large row's rounding
+  error swamp every other equation;
+* the *infinity norm of the solution*. The Jacobian has unknowns — fracture-intersection
+  temperatures above all — whose columns are some twelve orders of magnitude weaker than
+  its largest entries, hence numerically null. A factorisation may then return an
+  enormous component along that near-null direction while leaving the residual small, so
+  the backward error cannot see it but the update norm can.
 
 """
 
@@ -36,7 +46,8 @@ class SolveRecord:
     """Per-solve statistics accumulated by :class:`InstrumentedSolver`."""
 
     solve_times: list[float] = field(default_factory=list)
-    relative_residuals: list[float] = field(default_factory=list)
+    backward_errors: list[float] = field(default_factory=list)
+    update_norms: list[float] = field(default_factory=list)
     num_failures: int = 0
 
     def summary(self) -> dict[str, Any]:
@@ -47,10 +58,36 @@ class SolveRecord:
             "num_solves": len(self.solve_times),
             "total_solve_time": float(np.sum(self.solve_times)),
             "mean_solve_time": float(np.mean(self.solve_times)),
-            "max_relative_residual": float(np.max(self.relative_residuals)),
-            "median_relative_residual": float(np.median(self.relative_residuals)),
+            "max_backward_error": float(np.max(self.backward_errors)),
+            "median_backward_error": float(np.median(self.backward_errors)),
+            "max_update_norm": float(np.max(self.update_norms)),
             "num_failures": self.num_failures,
         }
+
+
+def backward_error(
+    matrix: sps.spmatrix, rhs: np.ndarray, solution: np.ndarray
+) -> float:
+    """Return the largest residual relative to the terms forming its own equation.
+
+    Parameters:
+        matrix: The solved system's matrix.
+        rhs: The solved system's right-hand side.
+        solution: The solution returned by the solver.
+
+    Returns:
+        ``max_i |r_i| / (max_j |a_ij| * ||x||_inf + |b_i|)``, which is of the order of
+        machine precision for a solve that can be trusted, irrespective of how the rows
+        are scaled relative to each other.
+
+    """
+    residual = np.abs(matrix @ solution - rhs)
+    row_max = abs(matrix).max(axis=1).toarray().ravel()
+    equation_scale = row_max * np.max(np.abs(solution)) + np.abs(rhs)
+    significant = equation_scale > 0
+    if not significant.any():
+        return 0.0
+    return float(np.max(residual[significant] / equation_scale[significant]))
 
 
 class InstrumentedSolver(pp.solvers.LinearSolverBase):
@@ -72,23 +109,24 @@ class InstrumentedSolver(pp.solvers.LinearSolverBase):
     def solve_linear_system(
         self, linear_system: pp.solvers.LinearSystem
     ) -> tuple[np.ndarray, pp.solvers.LinearSolverStatus]:
-        """Solve, then record the time taken and the true relative residual."""
+        """Solve, then record the time taken, the backward error and the update norm."""
         matrix, rhs = linear_system.matrix, linear_system.rhs
         t_0 = time.time()
         solution, status = self.delegate.solve_linear_system(linear_system)
         self.record.solve_times.append(time.time() - t_0)
         if status.is_failure():
             self.record.num_failures += 1
-            self.record.relative_residuals.append(np.inf)
+            self.record.backward_errors.append(np.inf)
+            self.record.update_norms.append(np.inf)
         else:
             assert matrix is not None
-            scale = max(float(np.linalg.norm(rhs)), np.finfo(float).tiny)
-            residual = float(np.linalg.norm(matrix @ solution - rhs)) / scale
-            self.record.relative_residuals.append(residual)
+            self.record.backward_errors.append(backward_error(matrix, rhs, solution))
+            self.record.update_norms.append(float(np.max(np.abs(solution))))
         logger.info(
-            "Linear solve: %.2e s, relative residual %.2e",
+            "Linear solve: %.2e s, backward error %.2e, ||update||_inf %.2e",
             self.record.solve_times[-1],
-            self.record.relative_residuals[-1],
+            self.record.backward_errors[-1],
+            self.record.update_norms[-1],
         )
         return solution, status
 

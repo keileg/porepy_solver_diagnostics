@@ -1,0 +1,54 @@
+"""Tests for the accuracy measures the experiment harness puts around every solve.
+
+A failure here means the harness can no longer tell a trustworthy linear solve from an
+untrustworthy one, which is the guard the whole campaign leans on: on this model's
+systems a wrong answer is otherwise reported as success.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import scipy.sparse as sps
+
+from solver_experiments.linear_solvers import backward_error
+
+
+@pytest.fixture
+def badly_scaled_system() -> tuple[sps.csr_matrix, np.ndarray, np.ndarray]:
+    """A diagonal system whose rows span twenty orders of magnitude."""
+    scales = np.array([1e10, 1.0, 1e-10])
+    matrix = sps.diags(scales).tocsr()
+    solution = np.array([2.0, 3.0, 4.0])
+    return matrix, matrix @ solution, solution
+
+
+def test_exact_solution_has_negligible_backward_error(badly_scaled_system) -> None:
+    matrix, rhs, solution = badly_scaled_system
+    assert backward_error(matrix, rhs, solution) < 1e-15
+
+
+def test_row_scaling_does_not_change_the_backward_error(badly_scaled_system) -> None:
+    """The point of the measure: a badly scaled row must not dominate the verdict."""
+    matrix, rhs, solution = badly_scaled_system
+    perturbed = solution + np.array([0.0, 0.0, 1e-8])
+    scaling = sps.diags(1.0 / abs(matrix).max(axis=1).toarray().ravel())
+    unscaled = backward_error(matrix, rhs, perturbed)
+    scaled = backward_error((scaling @ matrix).tocsr(), scaling @ rhs, perturbed)
+    assert unscaled == pytest.approx(scaled, rel=1e-12)
+
+
+def test_a_wrong_answer_in_a_weak_row_is_detected(badly_scaled_system) -> None:
+    """The weakest row is the one the plain relative residual cannot see."""
+    matrix, rhs, solution = badly_scaled_system
+    wrong = solution + np.array([0.0, 0.0, 1.0])
+    plain = np.linalg.norm(matrix @ wrong - rhs) / np.linalg.norm(rhs)
+    assert plain < 1e-19
+    assert backward_error(matrix, rhs, wrong) > 1e-2
+
+
+def test_empty_equations_are_ignored() -> None:
+    """A row that is zero on both sides carries no information and must not count."""
+    matrix = sps.csr_matrix(np.diag([1.0, 0.0]))
+    rhs = np.array([1.0, 0.0])
+    assert backward_error(matrix, rhs, np.array([1.0, 12.0])) == 0.0
