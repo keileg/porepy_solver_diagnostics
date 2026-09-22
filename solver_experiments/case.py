@@ -93,6 +93,12 @@ class SolverSpec:
         max_attempts: Time-step attempts before the run is given up.
         dt_min: Smallest admissible time step [s]. The run fails when a chop would go
             below it, so this bounds how hard the stepper is allowed to try.
+        divergence_atol: Absolute residual and increment magnitude at which the
+            nonlinear solver declares divergence. The example sets 1e12; PorePy's own
+            default is no bound at all. Since the blocks of this model's residual span
+            some forty orders of magnitude, any absolute bound is really a bound on the
+            worst-scaled block, so this is the knob that decides whether the solver is
+            allowed to attempt a step at all.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
 
     """
@@ -103,6 +109,7 @@ class SolverSpec:
     max_iterations: int = 25
     max_attempts: int = 10
     dt_min: float = 0.1 * pp.HOUR
+    divergence_atol: float = 1e12
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
 
@@ -262,6 +269,8 @@ def build_solver_params(solver: SolverSpec) -> dict:
     params = set_solver_params()
     params.pop("nonlinear_solver")
     params["nl_max_iterations"] = solver.max_iterations
+    params["nl_divergence_inc_atol"] = solver.divergence_atol
+    params["nl_divergence_res_atol"] = solver.divergence_atol
     params["prepare_simulation"] = False
     if solver.nonlinear_solver == "newton":
         params.pop("global_line_search")

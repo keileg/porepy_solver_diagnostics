@@ -34,6 +34,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max-iterations", type=int)
     parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--dt-min", type=float)
+    parser.add_argument("--divergence-atol", type=float)
     parser.add_argument("--results", type=Path, default=RESULTS)
     return parser.parse_args()
 
