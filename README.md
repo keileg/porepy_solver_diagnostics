@@ -15,7 +15,7 @@ cannot drift away from what PorePy ships.
 | Path | What |
 |---|---|
 | `solver_experiments/case.py` | `CaseSpec` (the varied axes), `SolverSpec`, model and solver construction |
-| `solver_experiments/linear_solvers.py` | PETSc direct solvers, row equilibration, per-solve residual checking |
+| `solver_experiments/linear_solvers.py` | PETSc direct solvers, row equilibration, per-solve accuracy checking |
 | `solver_experiments/instrumentation.py` | Wall-clock breakdown (Jacobian assembly, residual evaluation, linear solve) |
 | `solver_experiments/metrics.py` | Metrics derived from PorePy's solver telemetry |
 | `solver_experiments/runner.py` | `run_case(case, solver, directory)` → `metrics.json`, `telemetry.jsonl` |
@@ -48,10 +48,16 @@ failure can be attributed to the step that caused it.
 
 ## Environment notes
 
-* The linear solver matters more than usual here: the assembled system is very badly
-  row-scaled, and pypardiso returns a wrong answer on it without reporting failure. Every
-  solve is therefore residual-checked, and `max_relative_residual` in the metrics is the
-  field that says whether a run's linear algebra can be trusted at all.
+* The linear solver matters more than usual here, and it cannot be judged by
+  `||Ax-b||/||b||`: the assembled system's rows span twenty orders of magnitude, so that
+  number reports only on the worst-scaled block. Worse, the Jacobian is numerically
+  singular — a fracture-intersection temperature whose column is twelve orders below the
+  matrix norm — so a factorisation can return an enormous component along a direction the
+  system does not determine, while leaving the residual small. SuperLU does exactly that.
+  Every solve is therefore scored on two fields, `max_backward_error` and
+  `max_update_norm`, and both must look sane before a run's results mean anything. Run
+  with `--linear-backend pypardiso --row-equilibration`, which agrees with PETSc's MUMPS
+  and UMFPACK to 2e-10 and is seven times faster than SuperLU.
 * `pp_solvers` (the PETSc bridge, for iterative solvers) needs `scikit-learn` installed;
   its `solver_selection` subpackage imports it at module level.
 
