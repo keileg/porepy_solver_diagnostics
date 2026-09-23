@@ -85,7 +85,7 @@ def run_case(
     nonlinear_solver = build_solver(model, solver, recorder, linear_solver)
     runner = pp.ModelRunner(
         model,
-        _runner_params(solver),
+        _runner_params(solver, model),
         time_stepper=_time_stepper(model, solver, recorder),
         nonlinear_solver=nonlinear_solver,
     )
@@ -143,11 +143,11 @@ def _time_stepper(model, solver: SolverSpec, recorder):
     )
 
 
-def _runner_params(solver: SolverSpec) -> dict[str, Any]:
+def _runner_params(solver: SolverSpec, model) -> dict[str, Any]:
     """Parameters for `ModelRunner` itself, which must not name a nonlinear solver."""
     from .case import build_solver_params
 
-    return build_solver_params(solver)
+    return build_solver_params(solver, model)
 
 
 def _model_size(model) -> dict[str, Any]:

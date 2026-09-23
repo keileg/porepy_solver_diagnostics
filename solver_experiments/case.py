@@ -21,6 +21,7 @@ from porepy.examples.geothermal_reservoir import (
     set_solver_params,
 )
 
+from .convergence import RowScaledEquationMetric
 from .linear_solvers import build_linear_solver
 
 
@@ -103,6 +104,22 @@ class SolverSpec:
             some forty orders of magnitude, any absolute bound is really a bound on the
             worst-scaled block, so this is the knob that decides whether the solver is
             allowed to attempt a step at all.
+        convergence_criteria: ``"global"`` is the shipped choice, a single absolute
+            tolerance on the root-mean-square of the whole residual and increment
+            vector. ``"blockwise"`` instead measures every equation block in solution
+            units against its own residual at the start of the time step, and every
+            variable block against its own magnitude, so that a block is not exempted
+            from the test by being small in the units it happens to be posed in. See
+            :mod:`~solver_experiments.convergence`.
+        convergence_rtol: Factor by which each block must shrink, under
+            ``"blockwise"``.
+        convergence_atol: Floor below which a block counts as converged whatever its
+            reference, under ``"blockwise"``. It is what decides blocks that start out
+            already satisfied, where a relative test has nothing to measure against.
+        divergence_rtol: Factor by which a block may grow beyond its own reference
+            before ``"blockwise"`` declares divergence. ``divergence_atol`` has no
+            role there, since an absolute bound is exactly what block-wise tests
+            replace.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
 
     """
@@ -114,6 +131,10 @@ class SolverSpec:
     max_attempts: int = 10
     dt_min: float = 0.1 * pp.HOUR
     divergence_atol: float = 1e12
+    convergence_criteria: str = "global"
+    convergence_rtol: float = 1e-6
+    convergence_atol: float = 1e-10
+    divergence_rtol: float = 1e6
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
 
@@ -284,12 +305,18 @@ def nonlinear_solver_class(solver: SolverSpec) -> type:
     raise ValueError(f"Unknown nonlinear solver {solver.nonlinear_solver!r}.")
 
 
-def build_solver_params(solver: SolverSpec) -> dict:
+def build_solver_params(solver: SolverSpec, model=None) -> dict:
     """Assemble the nonlinear solver parameters, starting from the shipped ones.
 
     The shipped parameters name the solver class under ``"nonlinear_solver"``, which
     `ModelRunner` rejects when a solver instance is also passed to it. The class is
     dropped here and obtained from :func:`nonlinear_solver_class` instead.
+
+    Parameters:
+        solver: Solver configuration.
+        model: A prepared model, required only by ``convergence_criteria="blockwise"``,
+            whose metrics need the equation and variable indexers to split a vector
+            into blocks.
 
     """
     params = set_solver_params()
@@ -301,7 +328,75 @@ def build_solver_params(solver: SolverSpec) -> dict:
     if solver.nonlinear_solver == "newton":
         params.pop("global_line_search")
         params.pop("local_line_search")
+    if solver.convergence_criteria == "blockwise":
+        _set_blockwise_criteria(params, solver, model)
+    elif solver.convergence_criteria != "global":
+        raise ValueError(
+            f"Unknown convergence criteria {solver.convergence_criteria!r}."
+        )
     return params
+
+
+def _set_blockwise_criteria(params: dict, solver: SolverSpec, model) -> None:
+    """Replace the global tolerances by one test per equation and variable block.
+
+    PorePy refuses a criteria dictionary alongside the individual tolerance parameters
+    it would override, so those are removed here rather than left to be ignored.
+
+    Increments are split by variable and residuals by equation, since those are the
+    two blockings the respective vectors are indexed by; a single metric cannot serve
+    both.
+
+    """
+    if model is None:
+        raise ValueError("Block-wise convergence criteria need a prepared model.")
+    for key in (
+        "nl_max_iterations",
+        "nl_convergence_inc_atol",
+        "nl_convergence_res_atol",
+        "nl_convergence_inc_rtol",
+        "nl_convergence_res_rtol",
+        "nl_divergence_inc_atol",
+        "nl_divergence_res_atol",
+    ):
+        params.pop(key, None)
+
+    increment_metric = pp.VariableBasedEuclideanMetric(model)
+    residual_metric = RowScaledEquationMetric(model)
+    params["nl_convergence_criteria"] = {
+        "inc": pp.solvers.IncrementBasedCombinedCriterion(
+            atol=solver.convergence_atol,
+            rtol=solver.convergence_rtol,
+            metric=increment_metric,
+        ),
+        "res": pp.solvers.ResidualBasedCombinedCriterion(
+            atol=solver.convergence_atol,
+            rtol=solver.convergence_rtol,
+            metric=residual_metric,
+        ),
+    }
+    params["nl_divergence_criteria"] = {
+        "max_iter": pp.solvers.MaxIterationsCriterion(
+            max_iterations=solver.max_iterations
+        ),
+        "inc_nan": pp.solvers.IncrementBasedNanCriterion(),
+        "res_nan": pp.solvers.ResidualBasedNanCriterion(),
+        # The bound is `atol + rtol * reference`. Scaling the convergence floor by the
+        # same growth factor makes divergence the mirror of convergence: a block is
+        # given `divergence_rtol` times the room the convergence test allows it,
+        # whether that room comes from the floor or from the block's own reference.
+        # `divergence_atol` has no place here, being far above every block's own scale.
+        "inc_growth": pp.solvers.IncrementBasedCombinedDivergenceCriterion(
+            atol=solver.divergence_rtol * solver.convergence_atol,
+            rtol=solver.divergence_rtol,
+            metric=increment_metric,
+        ),
+        "res_growth": pp.solvers.ResidualBasedCombinedDivergenceCriterion(
+            atol=solver.divergence_rtol * solver.convergence_atol,
+            rtol=solver.divergence_rtol,
+            metric=residual_metric,
+        ),
+    }
 
 
 def build_solver(model, solver: SolverSpec, telemetry, linear_solver):
@@ -320,7 +415,7 @@ def build_solver(model, solver: SolverSpec, telemetry, linear_solver):
 
     """
     return nonlinear_solver_class(solver)(
-        params=build_solver_params(solver),
+        params=build_solver_params(solver, model),
         is_nonlinear_problem=model._is_nonlinear_problem(),
         linear_solver=linear_solver,
         telemetry=telemetry,

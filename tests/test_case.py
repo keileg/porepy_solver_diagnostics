@@ -167,3 +167,75 @@ def test_no_restart_options_without_a_previous_run() -> None:
     """An unrequested restart would silently resume someone else's state."""
     params = build_model_params(CaseSpec(), SolverSpec(), folder_name="results/new/viz")
     assert "restart_options" not in params
+
+
+def test_global_criteria_keep_the_shipped_tolerances() -> None:
+    """The default spec must leave the convergence test exactly as shipped."""
+    from porepy.examples.geothermal_reservoir import set_solver_params
+
+    from solver_experiments.case import build_solver_params
+
+    params = build_solver_params(SolverSpec())
+    shipped = set_solver_params()
+    assert "nl_convergence_criteria" not in params
+    for key in ("nl_convergence_inc_atol", "nl_convergence_res_atol"):
+        assert params[key] == shipped[key]
+
+
+class _StubModel:
+    """Enough of a model for the block-wise metrics, which only wrap and index."""
+
+    class equation_system:  # noqa: N801 - mirrors the attribute it stands in for
+        @staticmethod
+        def assemble(*args, **kwargs):
+            raise AssertionError("the stub model does not assemble")
+
+
+def test_blockwise_criteria_replace_the_global_tolerances() -> None:
+    """PorePy asserts that a criteria dictionary is not accompanied by the individual
+    tolerances it would override, so leaving one behind aborts the run."""
+    from solver_experiments.case import build_solver_params
+
+    params = build_solver_params(
+        SolverSpec(convergence_criteria="blockwise"), model=_StubModel()
+    )
+    assert set(params["nl_convergence_criteria"]) == {"inc", "res"}
+    assert "res_growth" in params["nl_divergence_criteria"]
+    for key in params:
+        assert not key.startswith(
+            (
+                "nl_convergence_inc",
+                "nl_convergence_res",
+                "nl_divergence_inc",
+                "nl_divergence_res",
+            )
+        )
+    assert "nl_max_iterations" not in params
+
+
+def test_blockwise_criteria_split_increments_and_residuals_differently() -> None:
+    """Increments are indexed by variable and residuals by equation; one metric used
+    for both would group entries by the wrong blocks."""
+    import porepy as pp
+
+    from solver_experiments.case import build_solver_params
+    from solver_experiments.convergence import RowScaledEquationMetric
+
+    criteria = build_solver_params(
+        SolverSpec(convergence_criteria="blockwise"), model=_StubModel()
+    )["nl_convergence_criteria"]
+    assert isinstance(criteria["inc"].metric, pp.VariableBasedEuclideanMetric)
+    assert isinstance(criteria["res"].metric, RowScaledEquationMetric)
+
+
+def test_blockwise_divergence_leaves_room_above_convergence() -> None:
+    """Convergence and divergence bounds that coincide leave an iterate no way to be
+    neither, so every step would be given up after its first iteration."""
+    from solver_experiments.case import build_solver_params
+
+    spec = SolverSpec(convergence_criteria="blockwise")
+    params = build_solver_params(spec, model=_StubModel())
+    converged = params["nl_convergence_criteria"]["res"]
+    diverged = params["nl_divergence_criteria"]["res_growth"]
+    assert diverged.atol == pytest.approx(spec.divergence_rtol * converged.atol)
+    assert diverged.rtol > converged.rtol
