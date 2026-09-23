@@ -28,6 +28,7 @@ from .linear_solvers import build_linear_solver
 UNIT_SYSTEMS = {
     "shipped": {"m": 1.0, "kg": 1.0e5, "K": 1.0},
     "si": {},
+    "pressure": {"kg": 1.0e7},
     "pressure_temperature": {"kg": 1.0e7, "K": 1.0e2},
 }
 """Candidate unit systems, named by what they make of order one.
