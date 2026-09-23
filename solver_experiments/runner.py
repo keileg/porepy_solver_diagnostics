@@ -63,8 +63,7 @@ def run_case(
         The metrics of the run, also written to `metrics.json`.
 
     """
-    output_directory.mkdir(parents=True, exist_ok=True)
-    telemetry_path = output_directory / "telemetry.jsonl"
+    telemetry_path = _prepare_output_directory(output_directory)
 
     timers = AssemblyTimers()
     model = build_model(
@@ -117,6 +116,21 @@ def run_case(
         json.dumps(metrics.as_dict(), indent=2, sort_keys=True, default=_json_default)
     )
     return metrics
+
+
+def _prepare_output_directory(output_directory: Path) -> Path:
+    """Create the run's directory and return the path of its telemetry file.
+
+    The telemetry file is opened for appending, so a rerun into a directory that
+    already holds one would concatenate the two runs. The metrics are derived from that
+    file, and a concatenation reads as a single run of twice the length rather than as
+    a mistake, so the stale file is removed here.
+
+    """
+    output_directory.mkdir(parents=True, exist_ok=True)
+    telemetry_path = output_directory / "telemetry.jsonl"
+    telemetry_path.unlink(missing_ok=True)
+    return telemetry_path
 
 
 def _build_recorder(solver: SolverSpec, telemetry_path: Path):

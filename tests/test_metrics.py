@@ -139,3 +139,16 @@ def test_line_search_summary_reports_the_deepest_backtrack():
     """A collapsing alpha is the field that separates mode B from mode A."""
     records = [iteration(1, alpha=1.0), iteration(2, alpha=0.02)]
     assert diagnosis(records)["line_search"]["min_alpha"] == pytest.approx(0.02)
+
+
+def test_a_rerun_does_not_inherit_the_previous_telemetry(tmp_path) -> None:
+    """Telemetry is appended to, and the metrics are derived from it, so a leftover
+    file would read as one run of twice the length rather than as a mistake."""
+    from solver_experiments.runner import _prepare_output_directory
+
+    stale = tmp_path / "run" / "telemetry.jsonl"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('{"kind": "from an earlier run"}\n')
+
+    assert _prepare_output_directory(tmp_path / "run") == stale
+    assert not stale.exists()
