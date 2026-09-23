@@ -10,6 +10,7 @@ PorePy actually ships.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -129,13 +130,22 @@ class SolverSpec:
         return "shipped" if not parts else "_".join(parts)
 
 
-def build_model_params(case: CaseSpec, solver: SolverSpec, folder_name: str) -> dict:
+def build_model_params(
+    case: CaseSpec,
+    solver: SolverSpec,
+    folder_name: str,
+    restart_from: Path | None = None,
+) -> dict:
     """Assemble the model parameters for one case.
 
     Parameters:
         case: The case to build.
         solver: Solver configuration, needed for the time-stepping bounds.
         folder_name: Where the model writes its visualisation output.
+        restart_from: Visualisation directory of an earlier run to resume from, or
+            `None` to start from the initial condition. The times file has to be named
+            explicitly: PorePy would otherwise look for it beside the *new* run's
+            output, where there is none yet.
 
     Returns:
         Model parameter dictionary for :class:`GeothermalReservoirWellBCs`.
@@ -143,6 +153,12 @@ def build_model_params(case: CaseSpec, solver: SolverSpec, folder_name: str) -> 
     """
     params = set_model_params()
     params["folder_name"] = folder_name
+    if restart_from is not None:
+        params["restart_options"] = {
+            "restart": True,
+            "pvd_file": restart_from / "data.pvd",
+            "times_file": restart_from / "times.json",
+        }
     params["injection_well_temperatures"] = case.injection_temperature
     params["lithostatic_stress_multipliers"] = np.asarray(
         case.lithostatic_multipliers, dtype=float
@@ -247,9 +263,16 @@ def _time_manager(
     )
 
 
-def build_model(case: CaseSpec, solver: SolverSpec, folder_name: str):
+def build_model(
+    case: CaseSpec,
+    solver: SolverSpec,
+    folder_name: str,
+    restart_from: Path | None = None,
+):
     """Instantiate the model for one case, without preparing the simulation."""
-    return GeothermalReservoirWellBCs(build_model_params(case, solver, folder_name))
+    return GeothermalReservoirWellBCs(
+        build_model_params(case, solver, folder_name, restart_from)
+    )
 
 
 def nonlinear_solver_class(solver: SolverSpec) -> type:

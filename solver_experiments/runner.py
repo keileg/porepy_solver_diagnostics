@@ -46,6 +46,7 @@ def run_case(
     case: CaseSpec,
     solver: SolverSpec,
     output_directory: Path,
+    restart_from: Path | None = None,
 ) -> RunMetrics:
     """Run one case with one solver configuration and write its metrics.
 
@@ -54,6 +55,9 @@ def run_case(
         solver: The solver configuration to run it with.
         output_directory: Directory for this run's three output files. Created if
             missing; existing files are overwritten.
+        restart_from: Results directory of an earlier run to resume from, so that a
+            single hard time step can be studied without paying for everything before
+            it. `None` starts from the initial condition.
 
     Returns:
         The metrics of the run, also written to `metrics.json`.
@@ -63,7 +67,12 @@ def run_case(
     telemetry_path = output_directory / "telemetry.jsonl"
 
     timers = AssemblyTimers()
-    model = build_model(case, solver, folder_name=str(output_directory / "viz"))
+    model = build_model(
+        case,
+        solver,
+        folder_name=str(output_directory / "viz"),
+        restart_from=None if restart_from is None else restart_from / "viz",
+    )
 
     t_0 = time.time()
     model.prepare_simulation()

@@ -35,6 +35,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max-attempts", type=int)
     parser.add_argument("--dt-min", type=float)
     parser.add_argument("--divergence-atol", type=float)
+    parser.add_argument(
+        "--restart-from",
+        type=Path,
+        help="Results directory of an earlier run to resume from, instead of starting "
+        "from the initial condition.",
+    )
     parser.add_argument("--results", type=Path, default=RESULTS)
     return parser.parse_args()
 
@@ -46,6 +52,7 @@ def build_specs(arguments: argparse.Namespace) -> tuple[CaseSpec, SolverSpec]:
         for name, value in vars(arguments).items()
         if value not in (None, False)
     }
+    given.pop("restart_from", None)
     case_fields = set(CaseSpec.__dataclass_fields__)
     solver_fields = set(SolverSpec.__dataclass_fields__)
     case_arguments = {
@@ -68,8 +75,11 @@ def main() -> None:
     )
     arguments = parse_arguments()
     case, solver = build_specs(arguments)
-    directory = arguments.results / f"{case.case_id}__{solver.solver_id}"
-    metrics = run_case(case, solver, directory)
+    name = f"{case.case_id}__{solver.solver_id}"
+    if arguments.restart_from is not None:
+        name += "__restarted"
+    directory = arguments.results / name
+    metrics = run_case(case, solver, directory, restart_from=arguments.restart_from)
     print(
         f"{case.case_id} / {solver.solver_id}: "
         f"{'success' if metrics.success else 'FAILED'} "

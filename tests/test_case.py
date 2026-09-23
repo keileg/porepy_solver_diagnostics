@@ -8,6 +8,8 @@ would be most expensive.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -144,3 +146,24 @@ def test_no_ramp_leaves_the_schedule_alone(shipped):
         unramped["time_manager"].schedule.get_array(),
         shipped["time_manager"].schedule.get_array(),
     )
+
+
+def test_restart_names_the_previous_run_s_times_file() -> None:
+    """PorePy defaults the times file to the new run's own output folder, where a
+    restarted run has none yet, so it has to be named explicitly or the restart
+    fails."""
+    previous = Path("results/previous/viz")
+    params = build_model_params(
+        CaseSpec(), SolverSpec(), folder_name="results/new/viz", restart_from=previous
+    )
+    assert params["restart_options"] == {
+        "restart": True,
+        "pvd_file": previous / "data.pvd",
+        "times_file": previous / "times.json",
+    }
+
+
+def test_no_restart_options_without_a_previous_run() -> None:
+    """An unrequested restart would silently resume someone else's state."""
+    params = build_model_params(CaseSpec(), SolverSpec(), folder_name="results/new/viz")
+    assert "restart_options" not in params
