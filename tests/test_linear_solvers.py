@@ -11,7 +11,12 @@ import numpy as np
 import pytest
 import scipy.sparse as sps
 
-from solver_experiments.linear_solvers import backward_error
+from solver_experiments.linear_solvers import (
+    POREPY_BACKENDS,
+    _reject_substituted_backend,
+    backward_error,
+    build_linear_solver,
+)
 
 
 @pytest.fixture
@@ -52,3 +57,23 @@ def test_empty_equations_are_ignored() -> None:
     matrix = sps.csr_matrix(np.diag([1.0, 0.0]))
     rhs = np.array([1.0, 0.0])
     assert backward_error(matrix, rhs, np.array([1.0, 12.0])) == 0.0
+
+
+@pytest.mark.parametrize("backend", ["superlu", "pypardiso"])
+def test_porepy_backends_are_named_after_the_solver(backend) -> None:
+    """The name identifies the factorisation, not the module it is reached through."""
+    solver = build_linear_solver(backend, row_equilibration=False, options={})
+    assert solver.delegate.backend == POREPY_BACKENDS[backend]
+
+
+def test_a_silently_substituted_backend_is_rejected() -> None:
+    """PorePy falls back when a backend's library is missing; a run must not inherit
+    that substitution unnoticed, or its results are attributed to the wrong solver."""
+    with pytest.raises(ValueError, match="fell back"):
+        _reject_substituted_backend("umfpack", "scipy_sparse")
+
+
+def test_an_unknown_backend_is_rejected_by_name() -> None:
+    """A silent fallback would attribute a run's behaviour to the wrong solver."""
+    with pytest.raises(ValueError, match="scipy_sparse"):
+        build_linear_solver("scipy_sparse", row_equilibration=False, options={})

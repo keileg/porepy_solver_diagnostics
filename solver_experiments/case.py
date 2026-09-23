@@ -83,8 +83,11 @@ class SolverSpec:
     """Solver configuration for one run.
 
     Parameters:
-        linear_backend: Which direct or iterative linear solver to use; see
-            :func:`~solver_experiments.linear_solvers.build_linear_solver`.
+        linear_backend: Which factorisation to use, named after the solver rather than
+            the module it is reached through; see
+            :func:`~solver_experiments.linear_solvers.build_linear_solver`. The default
+            is PorePy's own default, so that a run labelled ``shipped`` really is the
+            shipped solver stack.
         row_equilibration: Whether to scale each row of the linear system by its
             largest entry before handing it to the backend.
         nonlinear_solver: ``"constraint_line_search"`` (the shipped choice) or
@@ -103,7 +106,7 @@ class SolverSpec:
 
     """
 
-    linear_backend: str = "scipy_sparse"
+    linear_backend: str = "pypardiso"
     row_equilibration: bool = False
     nonlinear_solver: str = "constraint_line_search"
     max_iterations: int = 25

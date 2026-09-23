@@ -56,7 +56,7 @@ failure can be attributed to the step that caused it.
   by calling `prepare_simulation()` and then `assemble()` is not one the nonlinear loop
   solves — the loop assembles after `before_nonlinear_iteration` — and on this case such a
   matrix is numerically singular and ranks the backends in the wrong order. Measured
-  in-run, `scipy_sparse` (SuperLU) and the default `pypardiso` produce the identical
+  in-run, `superlu` and the default `pypardiso` produce the identical
   nonlinear trajectory, with SuperLU six orders more accurate per solve and six times
   slower. Row equilibration is available but is not worth it in-run.
 * `pp_solvers` (the PETSc bridge, for iterative solvers) needs `scikit-learn` installed;

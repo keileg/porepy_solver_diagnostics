@@ -9,7 +9,7 @@ backend. Two additions are needed here:
   :class:`RowEquilibratedSolver` makes that measurable instead of invisible by scaling
   each row by its largest entry before the solve.
 * :class:`PetscDirectSolver` reaches the MUMPS and UMFPACK factorisations built into
-  the local PETSc, which are both faster than SuperLU on these systems.
+  the local PETSc.
 
 :class:`InstrumentedSolver` wraps any of them and records how trustworthy every solve
 was, so a backend that returns a wrong answer cannot be mistaken for a nonlinear-solver
@@ -219,25 +219,77 @@ class PetscDirectSolver(pp.solvers.LinearSolverBase):
         )
 
 
+POREPY_BACKENDS: dict[str, str] = {
+    "superlu": "scipy_sparse",
+    "pypardiso": "pypardiso",
+    "umfpack": "umfpack",
+}
+"""Solvers reachable through PorePy's own `LinearSolverDirect`, by the name of the
+factorisation rather than of the module it is reached through: `scipy_sparse` names
+SciPy's binding, but the solver doing the work is SuperLU.
+
+"""
+
+PETSC_BACKENDS: dict[str, str] = {
+    "mumps": "mumps",
+    "umfpack_petsc": "umfpack",
+}
+"""Solvers reachable through PETSc's `KSP`, keyed the same way. UMFPACK appears twice
+because it is reachable through either portal, and the two differ in cost.
+
+"""
+
+
+def _reject_substituted_backend(requested: str, actual: str) -> None:
+    """Fail unless PorePy built the factorisation that was asked for.
+
+    `LinearSolverDirect` falls back silently when a backend's library is missing:
+    asking for `umfpack` without scikit-umfpack installed yields SuperLU. A run
+    attributed to the wrong solver is worse than a run that does not start.
+
+    Parameters:
+        requested: The backend name given to :func:`build_linear_solver`.
+        actual: The backend the constructed solver reports.
+
+    Raises:
+        ValueError: If the two disagree.
+
+    """
+    expected = POREPY_BACKENDS[requested]
+    if actual != expected:
+        raise ValueError(
+            f"Asked for {requested!r} ({expected!r}) but PorePy fell back to "
+            f"{actual!r}; install the missing library or choose another backend."
+        )
+
+
 def build_linear_solver(
     backend: str, row_equilibration: bool, options: dict[str, Any]
 ) -> InstrumentedSolver:
     """Build the linear solver named by a :class:`~solver_experiments.case.SolverSpec`.
 
     Parameters:
-        backend: ``"scipy_sparse"``, ``"pypardiso"`` or ``"umfpack"`` for PorePy's own
-            direct solver, ``"petsc_mumps"`` / ``"petsc_umfpack"`` for PETSc's, or
-            ``"petsc_iterative"`` for the `pp_solvers` PETSc bridge.
+        backend: The factorisation to use — a key of :data:`POREPY_BACKENDS` or
+            :data:`PETSC_BACKENDS`, or ``"petsc_iterative"`` for the `pp_solvers` PETSc
+            bridge, which names a family of solvers rather than one.
         row_equilibration: Whether to row-equilibrate before solving.
         options: Solver options, forwarded to the iterative solver only.
+
+    Raises:
+        ValueError: If the backend is not one of the known names.
 
     Returns:
         The solver, wrapped in :class:`InstrumentedSolver`.
 
     """
     solver: pp.solvers.LinearSolverBase
-    if backend.startswith("petsc_") and backend != "petsc_iterative":
-        solver = PetscDirectSolver(factor_solver_type=backend.removeprefix("petsc_"))
+    if backend in POREPY_BACKENDS:
+        solver = pp.solvers.LinearSolverDirect(
+            backend=POREPY_BACKENDS[backend]  # type: ignore[arg-type]
+        )
+        _reject_substituted_backend(backend, solver.backend)
+    elif backend in PETSC_BACKENDS:
+        solver = PetscDirectSolver(factor_solver_type=PETSC_BACKENDS[backend])
     elif backend == "petsc_iterative":
         import pp_solvers
 
@@ -245,7 +297,8 @@ def build_linear_solver(
             configuration_factory=pp_solvers.thm_factory, solver_options=options
         )
     else:
-        solver = pp.solvers.LinearSolverDirect(backend=backend)  # type: ignore[arg-type]
+        known = sorted([*POREPY_BACKENDS, *PETSC_BACKENDS, "petsc_iterative"])
+        raise ValueError(f"Unknown linear solver backend {backend!r}; known: {known}")
     if row_equilibration:
         solver = RowEquilibratedSolver(solver)
     return InstrumentedSolver(solver)
