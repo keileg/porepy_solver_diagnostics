@@ -25,6 +25,21 @@ from .convergence import RowScaledEquationMetric
 from .linear_solvers import build_linear_solver
 
 
+UNIT_SYSTEMS = {
+    "shipped": {"m": 1.0, "kg": 1.0e5, "K": 1.0},
+    "si": {},
+    "pressure_temperature": {"kg": 1.0e7, "K": 1.0e2},
+}
+"""Candidate unit systems, named by what they make of order one.
+
+`pressure_temperature` puts the injection pressure and the reservoir temperature at
+order one; `shipped` scales mass alone. Time is absent because PorePy refuses a
+non-unitary time scaling, which is the one scaling that would address the twelve orders
+between the three-dimensional mass and momentum balances.
+
+"""
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     """One point in the geothermal reservoir parameter space.
@@ -55,6 +70,7 @@ class CaseSpec:
             whole hour between well opening and the first pressure target is a single
             time step. Sub-intervals are equal rather than geometrically graded, since a
             graded ramp would violate `SolverSpec.dt_min` (0.1 h) at once.
+        units: Which of :data:`UNIT_SYSTEMS` the model is posed in.
 
     """
 
@@ -67,6 +83,7 @@ class CaseSpec:
     schedule_length: int = 5
     end_time_fraction: float = 1.0
     injection_ramp_steps: int = 1
+    units: str = "shipped"
 
     @property
     def case_id(self) -> str:
@@ -176,6 +193,7 @@ def build_model_params(
     """
     params = set_model_params()
     params["folder_name"] = folder_name
+    params["units"] = pp.Units(**UNIT_SYSTEMS[case.units])
     if restart_from is not None:
         params["restart_options"] = {
             "restart": True,

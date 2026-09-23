@@ -245,3 +245,23 @@ def test_blockwise_divergence_is_not_a_test_of_growth() -> None:
     for name in ("inc_bound", "res_bound"):
         assert criteria[name].tol == pytest.approx(spec.divergence_bound)
         assert not hasattr(criteria[name], "reference_value")
+
+
+def test_the_default_unit_system_is_the_shipped_one(shipped) -> None:
+    """The baseline must stay the shipped example, units included."""
+    from porepy.examples.geothermal_reservoir import set_model_params
+
+    example = set_model_params()["units"]
+    assert shipped["units"].kg == example.kg
+    assert shipped["units"].m == example.m
+    assert shipped["units"].K == example.K
+
+
+def test_a_named_unit_system_reaches_the_model() -> None:
+    """A unit system that silently failed to apply would make every scaling
+    measurement a measurement of the shipped one."""
+    params = build_model_params(
+        CaseSpec(units="pressure_temperature"), SolverSpec(), folder_name="unused"
+    )
+    assert params["units"].kg == 1.0e7
+    assert params["units"].K == 1.0e2
