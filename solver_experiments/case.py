@@ -116,10 +116,12 @@ class SolverSpec:
         convergence_atol: Floor below which a block counts as converged whatever its
             reference, under ``"blockwise"``. It is what decides blocks that start out
             already satisfied, where a relative test has nothing to measure against.
-        divergence_rtol: Factor by which an equation block's residual may grow beyond
-            its own reference before ``"blockwise"`` declares divergence.
-            ``divergence_atol`` has no role there, since an absolute bound is exactly
-            what block-wise tests replace.
+        divergence_bound: Magnitude at which ``"blockwise"`` declares divergence,
+            applied to each equation block's residual in solution units and to each
+            variable block's increment. It separates a runaway iterate, which reaches
+            1e+30 here, from the nine orders a contact block legitimately moves within
+            a step, which is why the bound is absolute rather than relative to
+            anything.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
 
     """
@@ -134,7 +136,7 @@ class SolverSpec:
     convergence_criteria: str = "global"
     convergence_rtol: float = 1e-6
     convergence_atol: float = 1e-10
-    divergence_rtol: float = 1e6
+    divergence_bound: float = 1e6
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
 
@@ -375,29 +377,25 @@ def _set_blockwise_criteria(params: dict, solver: SolverSpec, model) -> None:
             metric=residual_metric,
         ),
     }
+    # Divergence is tested against a fixed magnitude, not against a block's own
+    # earlier value. Growth says nothing here: a fracture cell changing contact state
+    # moves `normal_fracture_deformation` nine orders within a step, and an increment
+    # relative to its own variable is undefined for the well flux, which is zero until
+    # the well opens. What has to be caught is the iterate running away - updates reach
+    # 1e+30 - and dropping the test altogether is not an option: the run then iterates
+    # into a singular Jacobian and dies inside the property correlations, on an
+    # exception the nonlinear solver does not catch.
     params["nl_divergence_criteria"] = {
         "max_iter": pp.solvers.MaxIterationsCriterion(
             max_iterations=solver.max_iterations
         ),
         "inc_nan": pp.solvers.IncrementBasedNanCriterion(),
         "res_nan": pp.solvers.ResidualBasedNanCriterion(),
-        # The bound is `atol + rtol * reference`. Scaling the convergence floor by the
-        # same growth factor makes divergence the mirror of convergence: a block is
-        # given `divergence_rtol` times the room the convergence test allows it,
-        # whether that room comes from the floor or from the block's own reference.
-        # `divergence_atol` has no place here, being far above every block's own scale.
-        #
-        # There is deliberately no increment-based counterpart. The reference for an
-        # increment is the iterate itself, and the well flux and interface fluxes are
-        # zero until the well opens, so the step that opens it moves them by an
-        # unbounded factor of their own magnitude - a correct jump that any relative
-        # test reads as divergence. Measured: it ended every attempt of that step after
-        # one iteration, down to a time step of 7 s. A runaway update is visible in the
-        # residual anyway, which is measured in solution units against its own value.
-        "res_growth": pp.solvers.ResidualBasedCombinedDivergenceCriterion(
-            atol=solver.divergence_rtol * solver.convergence_atol,
-            rtol=solver.divergence_rtol,
-            metric=residual_metric,
+        "inc_bound": pp.solvers.IncrementBasedAbsoluteDivergenceCriterion(
+            tol=solver.divergence_bound, metric=increment_metric
+        ),
+        "res_bound": pp.solvers.ResidualBasedAbsoluteDivergenceCriterion(
+            tol=solver.divergence_bound, metric=residual_metric
         ),
     }
 

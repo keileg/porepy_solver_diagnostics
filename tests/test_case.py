@@ -204,7 +204,8 @@ def test_blockwise_criteria_replace_the_global_tolerances() -> None:
         "max_iter",
         "inc_nan",
         "res_nan",
-        "res_growth",
+        "inc_bound",
+        "res_bound",
     }
     for key in params:
         assert not key.startswith(
@@ -233,14 +234,14 @@ def test_blockwise_criteria_split_increments_and_residuals_differently() -> None
     assert isinstance(criteria["res"].metric, RowScaledEquationMetric)
 
 
-def test_blockwise_divergence_leaves_room_above_convergence() -> None:
-    """Convergence and divergence bounds that coincide leave an iterate no way to be
-    neither, so every step would be given up after its first iteration."""
+def test_blockwise_divergence_is_not_a_test_of_growth() -> None:
+    """A fracture cell changing contact state moves its block nine orders within a
+    step, so a bound relative to the block's own earlier value ends the attempt on a
+    state change rather than on a runaway iterate."""
     from solver_experiments.case import build_solver_params
 
     spec = SolverSpec(convergence_criteria="blockwise")
-    params = build_solver_params(spec, model=_StubModel())
-    converged = params["nl_convergence_criteria"]["res"]
-    diverged = params["nl_divergence_criteria"]["res_growth"]
-    assert diverged.atol == pytest.approx(spec.divergence_rtol * converged.atol)
-    assert diverged.rtol > converged.rtol
+    criteria = build_solver_params(spec, model=_StubModel())["nl_divergence_criteria"]
+    for name in ("inc_bound", "res_bound"):
+        assert criteria[name].tol == pytest.approx(spec.divergence_bound)
+        assert not hasattr(criteria[name], "reference_value")
