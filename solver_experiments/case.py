@@ -116,10 +116,10 @@ class SolverSpec:
         convergence_atol: Floor below which a block counts as converged whatever its
             reference, under ``"blockwise"``. It is what decides blocks that start out
             already satisfied, where a relative test has nothing to measure against.
-        divergence_rtol: Factor by which a block may grow beyond its own reference
-            before ``"blockwise"`` declares divergence. ``divergence_atol`` has no
-            role there, since an absolute bound is exactly what block-wise tests
-            replace.
+        divergence_rtol: Factor by which an equation block's residual may grow beyond
+            its own reference before ``"blockwise"`` declares divergence.
+            ``divergence_atol`` has no role there, since an absolute bound is exactly
+            what block-wise tests replace.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
 
     """
@@ -386,11 +386,14 @@ def _set_blockwise_criteria(params: dict, solver: SolverSpec, model) -> None:
         # given `divergence_rtol` times the room the convergence test allows it,
         # whether that room comes from the floor or from the block's own reference.
         # `divergence_atol` has no place here, being far above every block's own scale.
-        "inc_growth": pp.solvers.IncrementBasedCombinedDivergenceCriterion(
-            atol=solver.divergence_rtol * solver.convergence_atol,
-            rtol=solver.divergence_rtol,
-            metric=increment_metric,
-        ),
+        #
+        # There is deliberately no increment-based counterpart. The reference for an
+        # increment is the iterate itself, and the well flux and interface fluxes are
+        # zero until the well opens, so the step that opens it moves them by an
+        # unbounded factor of their own magnitude - a correct jump that any relative
+        # test reads as divergence. Measured: it ended every attempt of that step after
+        # one iteration, down to a time step of 7 s. A runaway update is visible in the
+        # residual anyway, which is measured in solution units against its own value.
         "res_growth": pp.solvers.ResidualBasedCombinedDivergenceCriterion(
             atol=solver.divergence_rtol * solver.convergence_atol,
             rtol=solver.divergence_rtol,

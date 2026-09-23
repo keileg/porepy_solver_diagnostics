@@ -200,7 +200,12 @@ def test_blockwise_criteria_replace_the_global_tolerances() -> None:
         SolverSpec(convergence_criteria="blockwise"), model=_StubModel()
     )
     assert set(params["nl_convergence_criteria"]) == {"inc", "res"}
-    assert "res_growth" in params["nl_divergence_criteria"]
+    assert set(params["nl_divergence_criteria"]) == {
+        "max_iter",
+        "inc_nan",
+        "res_nan",
+        "res_growth",
+    }
     for key in params:
         assert not key.startswith(
             (
