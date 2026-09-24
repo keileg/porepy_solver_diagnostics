@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import porepy as pp
@@ -70,8 +70,10 @@ class CaseSpec:
             closed-well initialisation entries alone. Scales the overpressure driving
             fracture opening and shear.
         lithostatic_multipliers: Per-axis multipliers of the lithostatic stress, i.e.
-            the in-situ stress anisotropy. The fractures dip at +/- 45 degrees about
-            the y axis, so the x/z ratio is what resolves shear onto them.
+            the in-situ stress anisotropy, each applied to the boundary faces normal to
+            its axis. Both fractures have unit normals (+-0.5, -+0.5, +-0.707), so x
+            and y weigh equally on them; lowering x raises the shear stress and lowers
+            the normal stress, and is the most direct way to push them towards slip.
         dilation_angle: Shear dilation angle [rad], the aperture-per-slip coupling
             that feeds the cubic law.
         cell_size: Matrix mesh size [m].
@@ -86,6 +88,10 @@ class CaseSpec:
             time step. Sub-intervals are equal rather than geometrically graded, since a
             graded ramp would violate `SolverSpec.dt_min` (0.1 h) at once.
         units: Which of :data:`UNIT_SYSTEMS` the model is posed in.
+        injection_duration: Time from the well opening to the end of the run [s].
+            `None` keeps the shipped schedule, which ends 100 days after the opening.
+            A longer duration appends one schedule point, holding the last injection
+            pressure, so thermal effects have time to build up.
 
     """
 
@@ -99,6 +105,7 @@ class CaseSpec:
     end_time_fraction: float = 1.0
     injection_ramp_steps: int = 1
     units: str = "shipped"
+    injection_duration: float | None = None
 
     @property
     def case_id(self) -> str:
@@ -130,6 +137,9 @@ class SolverSpec:
         max_attempts: Time-step attempts before the run is given up.
         dt_min: Smallest admissible time step [s]. The run fails when a chop would go
             below it, so this bounds how hard the stepper is allowed to try.
+        dt_max: Largest admissible time step [s]. `None` keeps the shipped bound,
+            the larger of a year and the initial step (three years). A smaller bound
+            also caps the initial step, and with it the initialisation's steps.
         divergence_atol: Absolute residual and increment magnitude at which the
             nonlinear solver declares divergence. The example sets 1e12; PorePy's own
             default is no bound at all. Since the blocks of this model's residual span
@@ -167,6 +177,7 @@ class SolverSpec:
     max_iterations: int = 25
     max_attempts: int = 10
     dt_min: float = 0.1 * pp.HOUR
+    dt_max: float | None = None
     divergence_atol: float = 1e12
     convergence_criteria: str = "global"
     convergence_rtol: float = 1e-6
@@ -263,7 +274,28 @@ def _schedule_and_pressures(
         pressures = _interpolated(
             times, _shipped_times(case, params), _scaled_pressures(case, params)
         )
+    if case.injection_duration is not None:
+        times, pressures = _extended_injection(case, params, times, pressures)
     return times, pressures
+
+
+def _extended_injection(
+    case: CaseSpec, params: dict, times: np.ndarray, pressures: list[float]
+) -> tuple[np.ndarray, list[float]]:
+    """Append a schedule point ending the run `injection_duration` after the opening.
+
+    The well opens at the second shipped schedule point. The appended point holds the
+    last injection pressure, so the extension changes the run only by its length.
+
+    """
+    opening = _shipped_times(case, params)[1]
+    end = opening + cast(float, case.injection_duration)
+    if case.schedule_length != 5 or end <= times[-1]:
+        raise ValueError(
+            "An injection duration extends the full shipped schedule, and must end "
+            "after it."
+        )
+    return np.append(times, end), [*pressures, pressures[-1]]
 
 
 def _shipped_times(case: CaseSpec, params: dict) -> np.ndarray:
@@ -315,11 +347,12 @@ def _time_manager(
 ) -> pp.TimeManager:
     """Build the time manager for a given schedule, keeping the shipped adaptivity."""
     shipped = params["time_manager"]
+    dt_max = max(pp.YEAR, shipped.dt_init) if solver.dt_max is None else solver.dt_max
     return pp.TimeManager(
         schedule=schedule,
-        dt_init=shipped.dt_init,
+        dt_init=min(shipped.dt_init, dt_max),
         constant_dt=False,
-        dt_min_max=(solver.dt_min, max(pp.YEAR, shipped.dt_init)),
+        dt_min_max=(solver.dt_min, dt_max),
         iter_optimal_range=(6, 10),
         iter_relax_factors=(0.5, 1.8),
     )

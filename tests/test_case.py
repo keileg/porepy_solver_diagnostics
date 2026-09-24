@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import porepy as pp
 import pytest
 
 from solver_experiments.case import (
@@ -284,3 +285,38 @@ def test_capping_hands_the_admissibility_bounds_to_the_model() -> None:
         CaseSpec(), SolverSpec(cap_to_bounds=True), folder_name="unused"
     )
     assert params["variable_bounds"] == ADMISSIBILITY_BOUNDS
+
+
+def test_injection_duration_appends_one_point_holding_the_last_pressure(
+    shipped,
+) -> None:
+    """Extending the run must change only its length, not the pressure history."""
+    params = build_model_params(
+        CaseSpec(injection_duration=30 * pp.YEAR), SolverSpec(), folder_name="unused"
+    )
+    shipped_times = shipped["time_manager"].schedule.get_array()
+    times = params["time_manager"].schedule.get_array()
+    assert np.array_equal(times[:-1], shipped_times)
+    assert np.isclose(times[-1], shipped_times[1] + 30 * pp.YEAR)
+    assert params["injection_well_pressures"] == [
+        *shipped["injection_well_pressures"],
+        shipped["injection_well_pressures"][-1],
+    ]
+
+
+def test_injection_duration_must_extend_the_shipped_schedule() -> None:
+    with pytest.raises(ValueError):
+        build_model_params(
+            CaseSpec(injection_duration=pp.DAY), SolverSpec(), folder_name="unused"
+        )
+
+
+def test_dt_max_caps_the_initial_step_too() -> None:
+    """The shipped initial step is three years, so a one-year bound must reach it, or
+    the time manager would start above its own maximum."""
+    params = build_model_params(
+        CaseSpec(), SolverSpec(dt_max=pp.YEAR), folder_name="unused"
+    )
+    time_manager = params["time_manager"]
+    assert time_manager.dt_min_max[1] == pp.YEAR
+    assert time_manager.dt_init == pp.YEAR

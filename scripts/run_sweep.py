@@ -18,8 +18,11 @@ import logging
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+import porepy as pp
 
 from solver_experiments import CaseSpec, SolverSpec, run_case
 
@@ -47,7 +50,7 @@ SWEEP_1: list[dict[str, Any]] = [
     {"injection_pressure_scale": 1.1},
     {"injection_pressure_scale": 1.2},
     {"injection_pressure_scale": 1.3},
-    # The x/z ratio resolves shear onto the fractures, which dip about the y axis.
+    # Lowering x raises the shear and lowers the normal stress on both fractures.
     {"lithostatic_multipliers": (0.7, 1.2, 1.0)},
     {"lithostatic_multipliers": (0.75, 1.2, 1.0)},
     {"lithostatic_multipliers": (0.85, 1.2, 1.0)},
@@ -62,13 +65,42 @@ SWEEP_1: list[dict[str, Any]] = [
 ]
 """First sweep: small steps along each axis, in Eirik's priority order."""
 
-SWEEPS = {"sweep_1": SWEEP_1}
+LONG_RUN = {"injection_duration": 30 * pp.YEAR}
+"""Thirty years of injection, long enough for a cooling front to reach the fractures."""
+
+LONG_TEMPERATURE: list[dict[str, Any]] = [
+    LONG_RUN,
+    *(
+        {**LONG_RUN, "injection_temperature": temperature}
+        for temperature in (320.0, 310.0, 290.0, 285.0)
+    ),
+]
+"""Thermal effects over thirty years, injection temperature the only axis."""
+
+STRESS_ANISOTROPY: list[dict[str, Any]] = [
+    {},
+    *(
+        {"lithostatic_multipliers": (x_multiplier, 1.2, 1.0)}
+        for x_multiplier in (0.6, 0.5, 0.4)
+    ),
+]
+"""Lower x multipliers than the first sweep's, to raise the shear-to-normal stress
+ratio on the fractures from 0.14 (shipped) to 0.33. Not below 0.4: at 0.3 the fracture
+at the injection well is close to slipping at hydrostatic pressure, before injection."""
+
+SWEEPS: dict[str, tuple[SolverSpec, list[dict[str, Any]]]] = {
+    "sweep_1": (REFERENCE_SOLVER, SWEEP_1),
+    "long_temperature": (replace(REFERENCE_SOLVER, dt_max=pp.YEAR), LONG_TEMPERATURE),
+    "stress_anisotropy": (REFERENCE_SOLVER, STRESS_ANISOTROPY),
+}
 
 
-def run_point(overrides: dict[str, Any], sweep_directory: Path) -> tuple[str, bool]:
+def run_point(
+    overrides: dict[str, Any], solver: SolverSpec, sweep_directory: Path
+) -> tuple[str, bool]:
     """Run one point in its own working directory, logging to a file there."""
     case = CaseSpec(**overrides)
-    run_directory = sweep_directory / f"{case.case_id}__{REFERENCE_SOLVER.solver_id}"
+    run_directory = sweep_directory / f"{case.case_id}__{solver.solver_id}"
     run_directory.mkdir(parents=True, exist_ok=True)
     os.chdir(run_directory)
     logging.basicConfig(
@@ -77,7 +109,7 @@ def run_point(overrides: dict[str, Any], sweep_directory: Path) -> tuple[str, bo
         force=True,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    metrics = run_case(case, REFERENCE_SOLVER, run_directory)
+    metrics = run_case(case, solver, run_directory)
     return case.case_id, metrics.as_dict()["success"]
 
 
@@ -89,13 +121,14 @@ def main() -> None:
     arguments = parser.parse_args()
 
     sweep_directory = RESULTS / arguments.name
+    solver, points = SWEEPS[arguments.name]
     context = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
         max_workers=arguments.workers, mp_context=context, max_tasks_per_child=1
     ) as pool:
         futures = [
-            pool.submit(run_point, overrides, sweep_directory)
-            for overrides in SWEEPS[arguments.name]
+            pool.submit(run_point, overrides, solver, sweep_directory)
+            for overrides in points
         ]
         for future in as_completed(futures):
             case_id, success = future.result()
