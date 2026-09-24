@@ -15,6 +15,9 @@ from typing import Any, cast
 
 import numpy as np
 import porepy as pp
+from porepy.applications.discretizations.flux_discretization import (
+    FluxDiscretization,
+)
 from porepy.examples.geothermal_reservoir import (
     GeothermalReservoirWellBCs,
     set_model_params,
@@ -164,6 +167,14 @@ class SolverSpec:
             1e+30 here, from the nine orders a contact block legitimately moves within
             a step, which is why the bound is absolute rather than relative to
             anything.
+        darcy_flux_discretization: ``"mpfa"`` (shipped) or ``"tpfa"``, the base
+            discretisation of the Darcy flux.
+        differentiable_darcy: Whether the Darcy flux is differentiated with respect to
+            the permeability, so that Newton sees how fracture fluxes change with the
+            aperture, instead of rediscretising the flux between iterations. The
+            differentiation is TPFA-based: with a TPFA base Newton can in principle
+            converge quadratically, with an MPFA base it cannot, and has been seen to
+            behave erratically.
         cap_to_bounds: Whether the Newton increment is capped so that pressure and
             temperature stay within :data:`ADMISSIBILITY_BOUNDS`. Without it, the
             bounds are only counted.
@@ -183,6 +194,8 @@ class SolverSpec:
     convergence_rtol: float = 1e-6
     convergence_atol: float = 1e-10
     divergence_bound: float = 1e6
+    darcy_flux_discretization: str = "mpfa"
+    differentiable_darcy: bool = False
     cap_to_bounds: bool = False
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
@@ -244,6 +257,7 @@ def build_model_params(
     params["time_manager"] = _time_manager(solver, params, schedule)
     if solver.cap_to_bounds:
         params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
+    params["darcy_flux_discretization"] = solver.darcy_flux_discretization
     return params
 
 
@@ -365,9 +379,26 @@ def build_model(
     restart_from: Path | None = None,
 ):
     """Instantiate the model for one case, without preparing the simulation."""
-    return GeothermalReservoirWellBCs(
+    return _model_class(solver)(
         build_model_params(case, solver, folder_name, restart_from)
     )
+
+
+def _model_class(solver: SolverSpec) -> type:
+    """The shipped model, with the Darcy flux discretisation the solver asks for.
+
+    The shipped class hard-codes an MPFA Darcy flux; a choice of base and the
+    differentiable flux are mixed in ahead of it, so they take precedence.
+
+    """
+    mixins: list[type] = []
+    if solver.differentiable_darcy:
+        mixins.append(pp.constitutive_laws.DarcysLawAd)
+    if solver.darcy_flux_discretization != "mpfa":
+        mixins.append(FluxDiscretization)
+    if not mixins:
+        return GeothermalReservoirWellBCs
+    return type("GeothermalReservoirVariant", (*mixins, GeothermalReservoirWellBCs), {})
 
 
 def nonlinear_solver_class(solver: SolverSpec) -> type:

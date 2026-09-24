@@ -320,3 +320,35 @@ def test_dt_max_caps_the_initial_step_too() -> None:
     time_manager = params["time_manager"]
     assert time_manager.dt_min_max[1] == pp.YEAR
     assert time_manager.dt_init == pp.YEAR
+
+
+@pytest.mark.parametrize(
+    ("solver", "flux_owner", "discretization_owner"),
+    [
+        (SolverSpec(), "DarcysLaw", "DarcysLaw"),
+        (
+            SolverSpec(darcy_flux_discretization="tpfa"),
+            "DarcysLaw",
+            "FluxDiscretization",
+        ),
+        (
+            SolverSpec(darcy_flux_discretization="tpfa", differentiable_darcy=True),
+            "DarcysLawAd",
+            "FluxDiscretization",
+        ),
+    ],
+)
+def test_darcy_flux_variants_take_precedence(
+    solver, flux_owner, discretization_owner
+) -> None:
+    """A variant must supply the Darcy flux methods ahead of the shipped DarcysLaw, or
+    the run silently uses the shipped flux and the comparison measures nothing."""
+    from solver_experiments.case import _model_class
+
+    model_class = _model_class(solver)
+
+    def owner(method: str) -> str:
+        return next(c for c in model_class.__mro__ if method in c.__dict__).__name__
+
+    assert owner("darcy_flux") == flux_owner
+    assert owner("darcy_flux_discretization") == discretization_owner
