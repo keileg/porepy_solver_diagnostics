@@ -11,6 +11,7 @@ from __future__ import annotations
 import platform
 import socket
 import subprocess
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,8 @@ class RunMetrics:
         solver_id: Identifier of the solver configuration.
         success: Whether the run reached its scheduled end time.
         failure_reason: Why it stopped, if it did not.
+        classification: Cost category and mechanism labels of the costly time-step
+            attempts, from PorePy's step classifier; see :func:`classification_summary`.
         provenance: Code versions, machine and tolerances, so the numbers stay
             interpretable once any of those move.
 
@@ -54,6 +57,7 @@ class RunMetrics:
     time_steps: dict[str, Any]
     iterations: dict[str, Any]
     diagnosis: dict[str, Any]
+    classification: dict[str, Any] = field(default_factory=dict)
     provenance: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -71,8 +75,14 @@ def collect_metrics(
     timing: dict[str, Any],
     linear_solver: dict[str, Any],
     telemetry_path: Path | None,
+    expensive_iterations: int,
 ) -> RunMetrics:
-    """Assemble the metrics for one finished run."""
+    """Assemble the metrics for one finished run.
+
+    `expensive_iterations` is the upper end of the run's own time-step controller range,
+    above which an accepted attempt counts as expensive.
+
+    """
     records = _read_records(telemetry_path)
     return RunMetrics(
         case_id=case_id,
@@ -86,6 +96,7 @@ def collect_metrics(
         time_steps=time_step_statistics(records),
         iterations=iteration_statistics(records),
         diagnosis=diagnosis(records),
+        classification=classification_summary(records, expensive_iterations),
         provenance=provenance(),
     )
 
@@ -278,6 +289,42 @@ def _line_search_summary(iterations: list[dict[str, Any]]) -> dict[str, Any] | N
         "min_alpha": float(np.min(alphas)),
         "median_alpha": float(np.median(alphas)),
         "num_iterations_below_0.5": int(np.sum(np.array(alphas) < 0.5)),
+    }
+
+
+def classification_summary(
+    records: list[dict[str, Any]], expensive_iterations: int
+) -> dict[str, Any]:
+    """Classify every time-step attempt and summarise the costly ones.
+
+    Returns:
+        The threshold used; counts of cost categories and of mechanism labels; the
+        number of costly attempts no rule explains; every costly attempt with its
+        labels and their evidence; and the stretches where cutting the step size did
+        not reduce the iterations.
+
+    """
+    run = pp.solvers.classify_run(
+        records,
+        pp.solvers.ClassificationThresholds(expensive_iterations=expensive_iterations),
+    )
+    costly = [a for a in run.attempts if a.cost in ("failed", "expensive")]
+    return {
+        "expensive_iterations": expensive_iterations,
+        "cost_counts": dict(Counter(a.cost for a in run.attempts)),
+        "label_counts": dict(Counter(label.code for a in costly for label in a.labels)),
+        "num_unlabelled_costly": sum(1 for a in costly if not a.labels),
+        "costly_attempts": [
+            {
+                "attempt": a.index,
+                "cost": a.cost,
+                "iterations": a.num_iterations,
+                "dt": a.dt,
+                "labels": {label.code: label.evidence for label in a.labels},
+            }
+            for a in costly
+        ],
+        "step_size_insensitive": run.step_size_insensitive,
     }
 
 

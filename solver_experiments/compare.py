@@ -28,6 +28,9 @@ COLUMNS: list[tuple[str, str]] = [
     ("open", "{max_open}"),
     ("cycl", "{num_iterations_cycling}"),
     ("dominant block", "{dominant_block}"),
+    ("labels", "{labels}"),
+    ("unexpl", "{num_unlabelled_costly}"),
+    ("insens", "{num_insensitive}"),
 ]
 """Column headers and their format strings, applied to :func:`flatten`'s output."""
 
@@ -67,6 +70,21 @@ def flatten(metrics: dict[str, Any]) -> dict[str, Any]:
         "max_open": contact.get("max_open", "-"),
         "num_iterations_cycling": cycling.get("num_iterations_cycling", "-"),
         "dominant_block": next(iter(blocks), "-").removesuffix("_equation"),
+        **_classification_columns(metrics.get("classification") or {}),
+    }
+
+
+def _classification_columns(classification: dict[str, Any]) -> dict[str, Any]:
+    """Mechanism label counts, costly attempts no rule explains, and stretches where a
+    smaller step did not mean fewer iterations; `-` for a run classified before the
+    classifier existed."""
+    if not classification:
+        return {"labels": "-", "num_unlabelled_costly": "-", "num_insensitive": "-"}
+    counts = classification["label_counts"]
+    return {
+        "labels": " ".join(f"{code}:{counts[code]}" for code in sorted(counts)) or "-",
+        "num_unlabelled_costly": classification["num_unlabelled_costly"],
+        "num_insensitive": len(classification["step_size_insensitive"]),
     }
 
 

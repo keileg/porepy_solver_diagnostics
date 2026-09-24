@@ -101,6 +101,7 @@ def run_case(
         timing=timers.summary(),
         linear_solver=linear_solver.record.summary(),
         telemetry_path=telemetry_path if recorder is not None else None,
+        expensive_iterations=model.time_manager.iter_optimal_range[1],
     )
     (output_directory / "metrics.json").write_text(
         json.dumps(metrics.as_dict(), indent=2, sort_keys=True, default=_json_default)

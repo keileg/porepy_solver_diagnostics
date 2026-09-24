@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from solver_experiments.metrics import (
+    classification_summary,
     diagnosis,
     group_by_attempt,
     iteration_statistics,
@@ -152,3 +153,39 @@ def test_a_rerun_does_not_inherit_the_previous_telemetry(tmp_path) -> None:
 
     assert _prepare_output_directory(tmp_path / "run") == stale
     assert not stale.exists()
+
+
+def test_classification_summary_reports_costly_attempts_with_evidence() -> None:
+    """A rejected attempt with a failed linear solve, then an accepted one within the
+    controller's range: only the first is costly, and it is labelled L."""
+
+    def classified_iteration(index: int, solved: bool = True) -> dict:
+        return {
+            **iteration(index),
+            "linear_solver": {"success": solved},
+            "divergence_status": {},
+            "admissibility": {},
+        }
+
+    records = [
+        classified_iteration(1),
+        classified_iteration(2, solved=False),
+        time_step("in_progress", dt=100.0),
+        classified_iteration(1),
+        time_step("successful", dt=50.0),
+    ]
+
+    summary = classification_summary(records, expensive_iterations=10)
+
+    assert summary["cost_counts"] == {"failed": 1, "normal": 1}
+    assert summary["label_counts"] == {"L": 1}
+    assert summary["num_unlabelled_costly"] == 0
+    assert summary["costly_attempts"] == [
+        {
+            "attempt": 0,
+            "cost": "failed",
+            "iterations": 2,
+            "dt": 100.0,
+            "labels": {"L": {"failed_solves_at_iterations": [2]}},
+        }
+    ]
