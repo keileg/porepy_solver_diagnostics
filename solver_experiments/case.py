@@ -41,6 +41,20 @@ between the three-dimensional mass and momentum balances.
 """
 
 
+ADMISSIBILITY_BOUNDS = {
+    "pressure": (0.0, np.inf),
+    "temperature": (273.16, 647.0),
+}
+"""Bounds outside which an iterate is not physical for this case, in SI units.
+
+Pressure must stay positive, and the fluid is liquid water, so its triple point and
+critical temperature bound the temperature. The model's own fluid laws are defined
+beyond these (density is exponential in both), so the bounds are plausibility bounds
+rather than validity limits; what an unbounded temperature breaks is the density.
+
+"""
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     """One point in the geothermal reservoir parameter space.
@@ -140,6 +154,9 @@ class SolverSpec:
             1e+30 here, from the nine orders a contact block legitimately moves within
             a step, which is why the bound is absolute rather than relative to
             anything.
+        cap_to_bounds: Whether the Newton increment is capped so that pressure and
+            temperature stay within :data:`ADMISSIBILITY_BOUNDS`. Without it, the
+            bounds are only counted.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
 
     """
@@ -155,6 +172,7 @@ class SolverSpec:
     convergence_rtol: float = 1e-6
     convergence_atol: float = 1e-10
     divergence_bound: float = 1e6
+    cap_to_bounds: bool = False
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
 
@@ -213,6 +231,8 @@ def build_model_params(
     schedule, pressures = _schedule_and_pressures(case, params)
     params["injection_well_pressures"] = pressures
     params["time_manager"] = _time_manager(solver, params, schedule)
+    if solver.cap_to_bounds:
+        params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
     return params
 
 

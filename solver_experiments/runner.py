@@ -18,28 +18,17 @@ import numpy as np
 import porepy as pp
 
 from .case import (
+    ADMISSIBILITY_BOUNDS,
     CaseSpec,
     SolverSpec,
     build_case_linear_solver,
     build_model,
     build_solver,
 )
-from .instrumentation import AssemblyTimers, instrument_assembly
+from .instrumentation import AssemblyTimers, count_capped_dofs, instrument_assembly
 from .metrics import RunMetrics, collect_metrics
 
 logger = logging.getLogger(__name__)
-
-ADMISSIBILITY_BOUNDS = {
-    "pressure": (0.0, 1.0e9),
-    "temperature": (273.16, 647.0),
-}
-"""Bounds outside which an iterate is not physical for this case.
-
-Pressure must stay positive, and the water property correlations are formulated for
-liquid water, so its triple point and critical temperature bound the temperature. The
-counts are diagnostic only: nothing in the solver acts on them.
-
-"""
 
 
 def run_case(
@@ -79,9 +68,10 @@ def run_case(
     timers.extra = _model_size(model)
 
     instrument_assembly(model, timers)
-    recorder = _build_recorder(solver, telemetry_path)
+    recorder = _build_recorder(solver, telemetry_path, model)
     linear_solver = build_case_linear_solver(solver)
     nonlinear_solver = build_solver(model, solver, recorder, linear_solver)
+    count_capped_dofs(nonlinear_solver, timers)
     runner = pp.ModelRunner(
         model,
         _runner_params(solver, model),
@@ -133,7 +123,7 @@ def _prepare_output_directory(output_directory: Path) -> Path:
     return telemetry_path
 
 
-def _build_recorder(solver: SolverSpec, telemetry_path: Path):
+def _build_recorder(solver: SolverSpec, telemetry_path: Path, model):
     """Build the telemetry recorder, or None if telemetry is switched off."""
     if solver.telemetry_verbosity == 0:
         return None
@@ -141,9 +131,28 @@ def _build_recorder(solver: SolverSpec, telemetry_path: Path):
         pp.solvers.TelemetryConfig(
             output_path=telemetry_path,
             verbosity=solver.telemetry_verbosity,
-            admissibility_bounds=ADMISSIBILITY_BOUNDS,
+            admissibility_bounds=admissibility_bounds_in_model_units(model),
         )
     )
+
+
+def admissibility_bounds_in_model_units(model) -> dict[str, tuple[float, float]]:
+    """:data:`ADMISSIBILITY_BOUNDS` in the units the model stores its values in.
+
+    The telemetry compares the bounds against stored values, which are scaled: under
+    the shipped units pressure is stored in units of 1e5 Pa, and a bound left in SI
+    would count the wrong cells.
+
+    """
+    converted = {}
+    for name, (lower, upper) in ADMISSIBILITY_BOUNDS.items():
+        variable = model.equation_system.get_variables([name])[0]
+        si_units = variable.tags["si_units"]
+        converted[name] = (
+            model.units.convert_units(lower, si_units),
+            model.units.convert_units(upper, si_units),
+        )
+    return converted
 
 
 def _time_stepper(model, solver: SolverSpec, recorder):

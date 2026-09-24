@@ -13,7 +13,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from solver_experiments.case import CaseSpec, SolverSpec, build_model_params
+from solver_experiments.case import (
+    ADMISSIBILITY_BOUNDS,
+    CaseSpec,
+    SolverSpec,
+    build_model_params,
+)
 
 
 @pytest.fixture
@@ -265,3 +270,17 @@ def test_a_named_unit_system_reaches_the_model() -> None:
     )
     assert params["units"].kg == 1.0e7
     assert params["units"].K == 1.0e2
+
+
+def test_bounds_are_only_counted_by_default(shipped) -> None:
+    """The baseline must not cap the Newton increment, or it is no longer shipped."""
+    assert "variable_bounds" not in shipped
+
+
+def test_capping_hands_the_admissibility_bounds_to_the_model() -> None:
+    """Capping acts on the same bounds the telemetry counts against, in SI units,
+    which the model converts itself."""
+    params = build_model_params(
+        CaseSpec(), SolverSpec(cap_to_bounds=True), folder_name="unused"
+    )
+    assert params["variable_bounds"] == ADMISSIBILITY_BOUNDS

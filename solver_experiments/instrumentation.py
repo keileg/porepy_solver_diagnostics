@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 
 @dataclass
 class AssemblyTimers:
@@ -83,3 +85,26 @@ def instrument_assembly(model, timers: AssemblyTimers) -> None:
         return result
 
     equation_system.assemble = timed_assemble  # type: ignore[method-assign]
+
+
+def count_capped_dofs(nonlinear_solver, timers: AssemblyTimers) -> None:
+    """Count the dofs whose Newton increment is capped to their variable bounds.
+
+    Capping changes the Newton direction, so how often and how widely it acts is
+    recorded rather than left to be inferred from the iteration counts.
+
+    Parameters:
+        nonlinear_solver: The Newton solver whose capping is instrumented, in place.
+        timers: Where the counts are accumulated, under ``capped_dofs``.
+
+    """
+    counts: list[int] = []
+    timers.extra["capped_dofs"] = counts
+    original_cap = nonlinear_solver.cap_increment_to_bounds
+
+    def counted_cap(model, increment):
+        capped = original_cap(model, increment)
+        counts.append(int(np.count_nonzero(capped != increment)))
+        return capped
+
+    nonlinear_solver.cap_increment_to_bounds = counted_cap
