@@ -95,6 +95,10 @@ class CaseSpec:
             `None` keeps the shipped schedule, which ends 100 days after the opening.
             A longer duration appends one schedule point, holding the last injection
             pressure, so thermal effects have time to build up.
+        well_depth: Depth of both wells' lower ends, as a fraction of the domain depth.
+            The shipped wells reach 0.8 and cross their fracture at 0.6, leaving two
+            dead-end cells below each crossing whose temperatures the linear system
+            barely separates. 0.6 ends the wells at the crossing instead.
 
     """
 
@@ -109,6 +113,7 @@ class CaseSpec:
     injection_ramp_steps: int = 1
     units: str = "shipped"
     injection_duration: float | None = None
+    well_depth: float = 0.8
 
     @property
     def case_id(self) -> str:
@@ -258,6 +263,7 @@ def build_model_params(
     if solver.cap_to_bounds:
         params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
     params["darcy_flux_discretization"] = solver.darcy_flux_discretization
+    params["well_depth"] = case.well_depth
     return params
 
 
@@ -379,19 +385,41 @@ def build_model(
     restart_from: Path | None = None,
 ):
     """Instantiate the model for one case, without preparing the simulation."""
-    return _model_class(solver)(
+    return _model_class(case, solver)(
         build_model_params(case, solver, folder_name, restart_from)
     )
 
 
-def _model_class(solver: SolverSpec) -> type:
-    """The shipped model, with the Darcy flux discretisation the solver asks for.
+class _WellDepth:
+    """Wells as shipped, but ending at the depth the case asks for."""
 
-    The shipped class hard-codes an MPFA Darcy flux; a choice of base and the
-    differentiable flux are mixed in ahead of it, so they take precedence.
+    params: dict
+    well_names: list[str]
+    domain_sizes: Any
+
+    def set_wells(self) -> None:
+        dx, dy, dz = self.domain_sizes()
+        depth = self.params["well_depth"] * dz
+        self._wells = [
+            pp.Well(
+                np.array([[x * dx, x * dx], [x * dy, x * dy], [0.0, -depth]]),
+                tags={"well_name": name},
+            )
+            for x, name in zip((0.4, 0.6), self.well_names)
+        ]
+
+
+def _model_class(case: CaseSpec, solver: SolverSpec) -> type:
+    """The shipped model, with the wells and Darcy flux discretisation asked for.
+
+    The shipped class hard-codes an MPFA Darcy flux and the well geometry; a choice of
+    base, the differentiable flux and other well depths are mixed in ahead of it, so
+    they take precedence.
 
     """
     mixins: list[type] = []
+    if case.well_depth != CaseSpec().well_depth:
+        mixins.append(_WellDepth)
     if solver.differentiable_darcy:
         mixins.append(pp.constitutive_laws.DarcysLawAd)
     if solver.darcy_flux_discretization != "mpfa":

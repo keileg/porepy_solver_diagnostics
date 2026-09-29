@@ -345,10 +345,35 @@ def test_darcy_flux_variants_take_precedence(
     the run silently uses the shipped flux and the comparison measures nothing."""
     from solver_experiments.case import _model_class
 
-    model_class = _model_class(solver)
+    model_class = _model_class(CaseSpec(), solver)
 
     def owner(method: str) -> str:
         return next(c for c in model_class.__mro__ if method in c.__dict__).__name__
 
     assert owner("darcy_flux") == flux_owner
     assert owner("darcy_flux_discretization") == discretization_owner
+
+
+@pytest.mark.parametrize("depth", [0.8, 0.6])
+def test_well_depth_sets_where_the_wells_end(depth: float) -> None:
+    """The mixin must reproduce the shipped wells at the shipped depth, so that the
+    geometry changes with the depth alone."""
+    from porepy.applications.md_grids.model_geometries import TwoWells3d
+
+    from solver_experiments.case import _WellDepth
+
+    class Shipped(TwoWells3d):
+        params = {"domain_sizes": np.array([1e3, 1e3, 1e3])}
+        units = pp.Units()
+
+    class Deepened(_WellDepth, Shipped):
+        params = {**Shipped.params, "well_depth": depth}
+
+    shipped, deepened = Shipped(), Deepened()
+    shipped.set_wells()
+    deepened.set_wells()
+    for a, b in zip(shipped._wells, deepened._wells):
+        assert np.allclose(b.pts[:, 0], a.pts[:, 0])
+        assert np.allclose(b.pts[:2, 1], a.pts[:2, 1])
+        assert np.isclose(b.pts[2, 1], -depth * 1e3)
+        assert b.tags == a.tags
