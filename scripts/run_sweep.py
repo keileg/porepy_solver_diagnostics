@@ -88,10 +88,34 @@ STRESS_ANISOTROPY: list[dict[str, Any]] = [
 ratio on the fractures from 0.14 (shipped) to 0.33. Not below 0.4: at 0.3 the fracture
 at the injection well is close to slipping at hydrostatic pressure, before injection."""
 
+CLEAN_SOLVER = replace(
+    REFERENCE_SOLVER, darcy_flux_discretization="tpfa", differentiable_darcy=True
+)
+"""The reference solver with the Darcy flux differentiated with respect to the
+aperture, which removes the lagged-permeability plateau at one-year steps."""
+
+WELLS_AT_FRACTURES = {"well_depth": 0.6}
+"""Wells ending where they cross their fracture. The shipped dead-end cells below the
+crossing are nearly singular in temperature, and with the iterative solver they alone
+produce an oscillation of the temperature increments that costs 12-15% of all Newton
+iterations over thirty years. Removing them leaves the contact mechanics as the source
+of whatever difficulty remains."""
+
+
+def _clean(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The same points with the wells ending at their fractures."""
+    return [{**point, **WELLS_AT_FRACTURES} for point in points]
+
+
 SWEEPS: dict[str, tuple[SolverSpec, list[dict[str, Any]]]] = {
     "sweep_1": (REFERENCE_SOLVER, SWEEP_1),
     "long_temperature": (replace(REFERENCE_SOLVER, dt_max=pp.YEAR), LONG_TEMPERATURE),
     "stress_anisotropy": (REFERENCE_SOLVER, STRESS_ANISOTROPY),
+    "clean_long_temperature": (
+        replace(CLEAN_SOLVER, dt_max=pp.YEAR),
+        _clean(LONG_TEMPERATURE),
+    ),
+    "clean_stress_anisotropy": (CLEAN_SOLVER, _clean(STRESS_ANISOTROPY)),
 }
 
 
