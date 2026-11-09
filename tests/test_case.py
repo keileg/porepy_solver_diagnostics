@@ -354,6 +354,30 @@ def test_darcy_flux_variants_take_precedence(
     assert owner("darcy_flux_discretization") == discretization_owner
 
 
+@pytest.mark.parametrize(
+    ("tangential_contact", "owner_name"),
+    [
+        ("projection", "TangentialContactMechanicsEquation"),
+        ("scaled_projection", "ScaledProjectionTangentialContactMechanicsEquation"),
+    ],
+)
+def test_tangential_contact_formulation_takes_precedence(
+    tangential_contact: str, owner_name: str
+) -> None:
+    """The scaled formulation must override the shipped one, or a comparison of the
+    two formulations silently runs the shipped one twice."""
+    from solver_experiments.case import _model_class
+
+    solver = SolverSpec(tangential_contact=tangential_contact)
+    model_class = _model_class(CaseSpec(), solver)
+    owner = next(
+        c
+        for c in model_class.__mro__
+        if "tangential_fracture_deformation_equation" in c.__dict__
+    )
+    assert owner.__name__ == owner_name
+
+
 @pytest.mark.parametrize("depth", [0.8, 0.6])
 def test_well_depth_sets_where_the_wells_end(depth: float) -> None:
     """The mixin must reproduce the shipped wells at the shipped depth, so that the

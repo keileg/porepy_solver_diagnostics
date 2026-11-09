@@ -180,6 +180,10 @@ class SolverSpec:
             differentiation is TPFA-based: with a TPFA base Newton can in principle
             converge quadratically, with an MPFA base it cannot, and has been seen to
             behave erratically.
+        tangential_contact: ``"projection"`` (shipped), the Alart-Curnier projection,
+            or ``"scaled_projection"``, the formulation PorePy shipped until it changed
+            its default. The two are equivalent up to a scaling, so they share their
+            solutions but not their Newton paths.
         cap_to_bounds: Whether the Newton increment is capped so that pressure and
             temperature stay within :data:`ADMISSIBILITY_BOUNDS`. Without it, the
             bounds are only counted.
@@ -201,6 +205,7 @@ class SolverSpec:
     divergence_bound: float = 1e6
     darcy_flux_discretization: str = "mpfa"
     differentiable_darcy: bool = False
+    tangential_contact: str = "projection"
     cap_to_bounds: bool = False
     telemetry_verbosity: int = 1
     solver_options: dict[str, Any] = field(default_factory=dict)
@@ -410,14 +415,20 @@ class _WellDepth:
 
 
 def _model_class(case: CaseSpec, solver: SolverSpec) -> type:
-    """The shipped model, with the wells and Darcy flux discretisation asked for.
+    """The shipped model, with the wells, Darcy flux and contact formulation asked for.
 
     The shipped class hard-codes an MPFA Darcy flux and the well geometry; a choice of
-    base, the differentiable flux and other well depths are mixed in ahead of it, so
-    they take precedence.
+    base, the differentiable flux, other well depths and the scaled tangential contact
+    formulation are mixed in ahead of it, so they take precedence.
 
     """
     mixins: list[type] = []
+    if solver.tangential_contact == "scaled_projection":
+        mixins.append(
+            pp.contact_mechanics.ScaledProjectionTangentialContactMechanicsEquation
+        )
+    elif solver.tangential_contact != "projection":
+        raise ValueError(f"Unknown tangential contact {solver.tangential_contact!r}.")
     if case.well_depth != CaseSpec().well_depth:
         mixins.append(_WellDepth)
     if solver.differentiable_darcy:
