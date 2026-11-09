@@ -16,9 +16,10 @@ unit for every equation, so one tolerance means the same thing in all blocks.
 from __future__ import annotations
 
 import numpy as np
+import porepy as pp
 
 
-class RowScaledEquationMetric:
+class RowScaledEquationMetric(pp.Metric):
     """Residual of each equation block, measured in solution units.
 
     The row scales are taken from the Jacobian the nonlinear solver last assembled,
