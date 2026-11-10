@@ -82,6 +82,9 @@ class Variant:
         steady_state: A ``steady_state.npz`` saved by an earlier run's
             initialisation, to start from instead of time stepping to a steady state.
             The pipeline still validates it against this run's model.
+        gmres_restart: GMRES restart length of the outer solve, replacing PETSc's
+            default as set by ``pp_solvers``; only for ``"thm_factory"`` and
+            ``"system_amg"``. None keeps the script's options.
 
     """
 
@@ -91,6 +94,7 @@ class Variant:
     stop_after: float | None = None
     mesh_only: bool = False
     steady_state: Path | None = None
+    gmres_restart: int | None = None
 
 
 @dataclass
@@ -300,7 +304,9 @@ class _Phase:
 
     def instrument(self, nonlinear_solver):
         """Swap the linear solver if asked, and wrap it; attach the recorder."""
-        delegate = _linear_solver(self.variant.linear_solver, nonlinear_solver)
+        delegate = _linear_solver(
+            self.variant.linear_solver, nonlinear_solver, self.variant.gmres_restart
+        )
         self.linear_solver = InstrumentedSolver(delegate)
         nonlinear_solver.linear_solver = self.linear_solver
         nonlinear_solver.telemetry = self.recorder
@@ -333,8 +339,12 @@ class _Phase:
         )
 
 
-def _linear_solver(choice: str, nonlinear_solver) -> pp.solvers.LinearSolverBase:
+def _linear_solver(
+    choice: str, nonlinear_solver, gmres_restart: int | None
+) -> pp.solvers.LinearSolverBase:
     """The linear solver a variant asks for; the script's own for ``"as_given"``."""
+    if gmres_restart is not None and choice not in ("thm_factory", "system_amg"):
+        raise ValueError(f"A GMRES restart needs a PETSc solver, not {choice!r}.")
     if choice == "as_given":
         return nonlinear_solver.linear_solver
     if choice == "pypardiso":
@@ -349,8 +359,14 @@ def _linear_solver(choice: str, nonlinear_solver) -> pp.solvers.LinearSolverBase
         factory = (
             thm_factory_system_amg if choice == "system_amg" else pp_solvers.thm_factory
         )
+        options = dict(linear_solver_params)
+        if gmres_restart is not None:
+            options["gmres"] = {
+                **options.get("gmres", {}),
+                "ksp_gmres_restart": gmres_restart,
+            }
         return pp_solvers.IterativeLinearSolver(
-            configuration_factory=factory, solver_options=linear_solver_params
+            configuration_factory=factory, solver_options=options
         )
     raise ValueError(
         f"Unknown linear solver {choice!r}, expected one of {LINEAR_SOLVERS}."
@@ -466,6 +482,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--stop-after-days", type=float)
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--steady-state", type=Path)
+    parser.add_argument("--gmres-restart", type=int)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -478,6 +495,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         steady_state=None
         if arguments.steady_state is None
         else arguments.steady_state.resolve(),
+        gmres_restart=arguments.gmres_restart,
     )
     return variant, arguments.directory.resolve()
 
