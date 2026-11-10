@@ -35,7 +35,6 @@ from pp_solvers.preconditioners import (
 from pp_solvers.transformations import ContactLinearTransformation, ScaleSpecificVolume
 
 SYSTEM_AMG_OPTIONS: dict[str, Any] = {
-    "gmres": {"ksp_max_it": 400},
     "system_amg": {
         "pc_hypre_boomeramg_P_max": 16,
         "pc_type": "hypre",
@@ -44,7 +43,13 @@ SYSTEM_AMG_OPTIONS: dict[str, Any] = {
         "pc_hypre_boomeramg_ilu_level": 0,
     },
 }
-"""The Coso PETSc options for the system-AMG stage, without the Krylov monitors."""
+"""The Coso PETSc options for the system-AMG stage.
+
+The Krylov options are left at the `pp_solvers` defaults, as for ``thm_factory`` in
+the ``"petsc_iterative"`` backend, so that the two backends differ only in the
+preconditioner. (The Coso scripts themselves raise ``ksp_max_it`` to 400.)
+
+"""
 
 
 def thm_factory_system_amg() -> LinearSolverConfiguration:
