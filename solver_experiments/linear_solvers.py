@@ -270,8 +270,9 @@ def build_linear_solver(
 
     Parameters:
         backend: The factorisation to use — a key of :data:`POREPY_BACKENDS` or
-            :data:`PETSC_BACKENDS`, or ``"petsc_iterative"`` for the `pp_solvers` PETSc
-            bridge, which names a family of solvers rather than one.
+            :data:`PETSC_BACKENDS`, ``"petsc_iterative"`` for the `pp_solvers` PETSc
+            bridge with ``thm_factory``, or ``"petsc_system_amg"`` for the same bridge
+            with the system-AMG configuration of :mod:`.preconditioners`.
         row_equilibration: Whether to row-equilibrate before solving.
         options: Solver options, forwarded to the iterative solver only.
 
@@ -296,8 +297,14 @@ def build_linear_solver(
         solver = pp_solvers.IterativeLinearSolver(
             configuration_factory=pp_solvers.thm_factory, solver_options=options
         )
+    elif backend == "petsc_system_amg":
+        from .preconditioners import system_amg_solver
+
+        solver = system_amg_solver(options)
     else:
-        known = sorted([*POREPY_BACKENDS, *PETSC_BACKENDS, "petsc_iterative"])
+        known = sorted(
+            [*POREPY_BACKENDS, *PETSC_BACKENDS, "petsc_iterative", "petsc_system_amg"]
+        )
         raise ValueError(f"Unknown linear solver backend {backend!r}; known: {known}")
     if row_equilibration:
         solver = RowEquilibratedSolver(solver)
