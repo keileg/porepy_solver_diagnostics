@@ -32,6 +32,7 @@ import logging
 import os
 import resource
 import runpy
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +43,7 @@ from typing import Any
 import numpy as np
 import porepy as pp
 import porepy.applications.initialization.initialization as initialization_module
+from porepy.applications.initialization.model_state_storage import ModelStateStorage
 
 from solver_experiments.case import ADMISSIBILITY_BOUNDS
 from solver_experiments.instrumentation import (
@@ -77,6 +79,9 @@ class Variant:
             the script's whole schedule.
         mesh_only: Stop after preparing the model, having recorded its size and
             well-fracture connections.
+        steady_state: A ``steady_state.npz`` saved by an earlier run's
+            initialisation, to start from instead of time stepping to a steady state.
+            The pipeline still validates it against this run's model.
 
     """
 
@@ -85,6 +90,7 @@ class Variant:
     cap: bool = False
     stop_after: float | None = None
     mesh_only: bool = False
+    steady_state: Path | None = None
 
 
 @dataclass
@@ -169,10 +175,15 @@ def _execute(script: Path, directory: Path) -> None:
 def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None:
     """Replace the initialisation pipeline and the model runner by instrumented ones."""
     original_pipeline = initialization_module.initialization_pipeline
+    # The initialisation's phase while the pipeline runs. The pipeline builds its own
+    # model runner, which must then pass through: its solver is instrumented already.
+    initialization_phase: list[_Phase] = []
 
     def instrumented_pipeline(model, *args, nonlinear_solver=None, **kwargs):
         if variant.cap:
             model.params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
+        if variant.steady_state is not None:
+            kwargs["storage"] = _private_copy(variant.steady_state, directory)
         if variant.mesh_only:
             model.prepare_simulation()
             record.model_size = _model_size(model)
@@ -180,22 +191,42 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             raise _MeshOnlyDone
         phase = _Phase("initialization", variant, directory, model)
         nonlinear_solver = phase.instrument(nonlinear_solver)
+        timers = AssemblyTimers()
+        count_capped_dofs(nonlinear_solver, timers)
+        initialization_phase.append(phase)
+        success, failure_reason = True, None
         t_0 = time.time()
         try:
             return original_pipeline(
                 model, *args, nonlinear_solver=nonlinear_solver, **kwargs
             )
+        except Exception as error:
+            success, failure_reason = False, f"{type(error).__name__}: {error}"
+            raise
         finally:
-            record.initialization_time = time.time() - t_0
-            phase.write_metrics(success=True, failure_reason=None, timers=None)
+            initialization_phase.clear()
+            timers.run_time = record.initialization_time = time.time() - t_0
+            phase.write_metrics(success, failure_reason, timers)
             record.phases_done.append("initialization")
 
     class InstrumentedModelRunner(pp.ModelRunner):
         """Model runner whose nonlinear solver and time stepper are instrumented."""
 
         def __init__(
-            self, model, params=None, time_stepper=None, nonlinear_solver=None
+            self,
+            model,
+            params=None,
+            time_stepper=None,
+            nonlinear_solver=None,
+            early_stop_criteria=None,
         ):
+            self._phase: _Phase | None = None
+            if initialization_phase:
+                super().__init__(
+                    model, params, time_stepper, nonlinear_solver, early_stop_criteria
+                )
+                self.time_stepper.telemetry = initialization_phase[0].recorder
+                return
             self._phase = _Phase("main", variant, directory, model)
             nonlinear_solver = self._phase.instrument(nonlinear_solver)
             assert time_stepper is not None, "The runscripts pass their own stepper."
@@ -206,7 +237,10 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
                 params=params,
                 time_stepper=time_stepper,
                 nonlinear_solver=nonlinear_solver,
-                early_stop_criteria=_stop_criteria(variant),
+                early_stop_criteria=[
+                    *(early_stop_criteria or []),
+                    *_stop_criteria(variant),
+                ],
             )
             record.model_size = _model_size(model)
             record.wells = _well_connections(model)
@@ -214,6 +248,8 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             count_capped_dofs(self.solver, self._timers)
 
         def run(self):
+            if self._phase is None:
+                return super().run()
             t_0 = time.time()
             status = super().run()
             self._timers.run_time = time.time() - t_0
@@ -229,6 +265,20 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
 
     initialization_module.initialization_pipeline = instrumented_pipeline
     pp.ModelRunner = InstrumentedModelRunner  # type: ignore[misc]
+
+
+def _private_copy(steady_state: Path, directory: Path) -> ModelStateStorage:
+    """Storage for a copy of a saved steady state, private to this run.
+
+    The pipeline deletes a stored state that does not match the model or fails its
+    validation, so the original must not be handed to it.
+
+    """
+    if not steady_state.is_file():
+        raise FileNotFoundError(f"No saved steady state at {steady_state}.")
+    copy = directory / "steady_state.npz"
+    shutil.copyfile(steady_state, copy)
+    return ModelStateStorage(copy)
 
 
 class _Phase:
@@ -415,6 +465,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--cap", action="store_true")
     parser.add_argument("--stop-after-days", type=float)
     parser.add_argument("--mesh-only", action="store_true")
+    parser.add_argument("--steady-state", type=Path)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -424,6 +475,9 @@ def _parse_arguments() -> tuple[Variant, Path]:
         if arguments.stop_after_days is None
         else arguments.stop_after_days * pp.DAY,
         mesh_only=arguments.mesh_only,
+        steady_state=None
+        if arguments.steady_state is None
+        else arguments.steady_state.resolve(),
     )
     return variant, arguments.directory.resolve()
 
