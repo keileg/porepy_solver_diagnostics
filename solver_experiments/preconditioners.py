@@ -5,9 +5,9 @@
 :data:`SYSTEM_AMG_OPTIONS` from its ``solver_configurations.py``. It differs from
 ``pp_solvers.thm_factory`` in the last stage of the nested Schur complements: instead
 of CPR (AMG on pressure, then ILU on temperature and pressure together), one hypre
-BoomerAMG acts on the interleaved temperature–pressure block. Temperature rows are also
-scaled by the specific volume. It is here to test whether this handles large
-temperature contrasts better than CPR, on cases other than Coso.
+BoomerAMG acts on the interleaved temperature–pressure block. The other stages and the
+transformations are those of ``thm_factory``. It is here to test whether this handles
+large temperature contrasts better than CPR, on cases other than Coso.
 
 """
 
