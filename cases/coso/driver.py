@@ -36,9 +36,10 @@ import shutil
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import porepy as pp
@@ -52,7 +53,11 @@ from solver_experiments.instrumentation import (
     count_capped_dofs,
     instrument_assembly,
 )
-from solver_experiments.linear_solvers import InstrumentedSolver, build_linear_solver
+from solver_experiments.linear_solvers import (
+    InstrumentedSolver,
+    backward_error,
+    build_linear_solver,
+)
 from solver_experiments.metrics import collect_metrics
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,14 @@ class Variant:
         gmres_restart: GMRES restart length of the outer solve, replacing PETSc's
             default as set by ``pp_solvers``; only for ``"thm_factory"`` and
             ``"system_amg"``. None keeps the script's options.
+        replay: Solver variants to also solve each system with, where the time step is
+            at least ``replay_min_dt``, before the run's own solver solves it (see
+            :class:`_Replay`). Each entry has a ``"label"``, and optionally a
+            ``"fixed_stress_scale"`` (a factor on ``pp_solvers``' fixed-stress term)
+            and ``"solver_options"`` (merged as ``solver_options`` is). Only for
+            ``"thm_factory"`` and ``"system_amg"``. None replays nothing.
+        replay_min_dt: Smallest time step [s] whose systems are replayed.
+        replay_systems: Number of systems to replay; the run stops after the last.
 
     """
 
@@ -108,6 +121,9 @@ class Variant:
     stop_at_step_cut: bool = False
     dump_systems_min_dt: float | None = None
     solver_options: dict[str, dict[str, Any]] | None = None
+    replay: list[dict[str, Any]] | None = None
+    replay_min_dt: float = 0.0
+    replay_systems: int = 3
 
 
 @dataclass
@@ -130,6 +146,10 @@ class _MeshOnlyDone(Exception):
 
 class _StoppedAtStepCut(Exception):
     """Raised to leave the script after the first time step that needed a retry."""
+
+
+class _ReplayDone(Exception):
+    """Raised to leave the script once the last system to replay has been solved."""
 
 
 class _StopAtStepCut(pp.models.model_runner.EarlyStopCriterion):
@@ -190,7 +210,7 @@ def run(variant: Variant, directory: Path) -> RunRecord:
     _install_hooks(variant, directory, record)
     try:
         _execute(tree / f"{variant.script}.py", directory)
-    except (_MeshOnlyDone, _StoppedAtStepCut):
+    except (_MeshOnlyDone, _StoppedAtStepCut, _ReplayDone):
         pass
     finally:
         # ru_maxrss is in kilobytes on Linux.
@@ -378,6 +398,17 @@ class _Phase:
                 self.directory / f"systems_{self.name}",
                 self.variant.dump_systems_min_dt,
             )
+        if self.variant.replay is not None:
+            nonlinear_solver.linear_solver = _Replay(
+                nonlinear_solver.linear_solver,
+                [
+                    _ReplayVariant.build(self.variant, entry)
+                    for entry in self.variant.replay
+                ],
+                self.directory / f"replay_{self.name}.jsonl",
+                self.variant.replay_min_dt,
+                self.variant.replay_systems,
+            )
         nonlinear_solver.telemetry = self.recorder
         return nonlinear_solver
 
@@ -476,6 +507,175 @@ def _block_indices(linear_system) -> dict[str, np.ndarray]:
     return blocks
 
 
+@dataclass
+class _ReplayVariant:
+    """A solver to replay systems with, and the fixed-stress scale it solves under."""
+
+    label: str
+    solver: pp.solvers.LinearSolverBase
+    fixed_stress_scale: float = 1.0
+
+    @classmethod
+    def build(cls, variant: Variant, entry: dict[str, Any]) -> _ReplayVariant:
+        if variant.linear_solver not in ("thm_factory", "system_amg"):
+            raise ValueError("Replay needs a PETSc solver.")
+        changes = _option_changes(variant)
+        for key, values in entry.get("solver_options", {}).items():
+            changes[key] = {**changes.get(key, {}), **values}
+        return cls(
+            label=entry["label"],
+            solver=_petsc_solver(variant.linear_solver, changes),
+            fixed_stress_scale=float(entry.get("fixed_stress_scale", 1.0)),
+        )
+
+
+class _Replay(pp.solvers.LinearSolverBase):
+    """Solve some of a run's linear systems with other solver variants as well.
+
+    Each system solved at a time step of at least ``min_dt`` is first solved by every
+    variant, each on its own copy, and then by the run's own solver, whose solution the
+    run continues with; the trajectory is that of the run's own solver. The variants
+    therefore see exactly the systems the run solves, with the model in the state it
+    assembled them in. Each solve's outcome is logged and appended to ``path`` as a
+    JSON line, together with the size of the fixed-stress term against the pressure
+    diagonal. The run stops after ``num_systems`` systems.
+
+    """
+
+    def __init__(
+        self,
+        delegate,
+        variants: list[_ReplayVariant],
+        path: Path,
+        min_dt: float,
+        num_systems: int,
+    ) -> None:
+        self.delegate = delegate
+        self.variants = variants
+        self.path = path
+        self.min_dt = min_dt
+        self.num_systems = num_systems
+        self.model = None
+        self.replayed = 0
+
+    def initialize_with_model(self, model) -> None:
+        self.model = model
+        self.delegate.initialize_with_model(model)
+        for variant in self.variants:
+            variant.solver.initialize_with_model(model)
+
+    def solve_linear_system(self, linear_system):
+        if self.model.time_manager.dt < self.min_dt:
+            return self.delegate.solve_linear_system(linear_system)
+        reference = linear_system.matrix.copy()
+        rhs = linear_system.rhs.copy()
+        self._write(
+            {"fixed_stress": _fixed_stress_against_pressure(self.model, linear_system)}
+        )
+        for variant in self.variants:
+            copy = pp.solvers.LinearSystem(
+                reference.copy(),
+                rhs.copy(),
+                linear_system.equation_indexer,
+                linear_system.variable_indexer,
+            )
+            with _fixed_stress_scaled(variant.fixed_stress_scale):
+                outcome = variant.solver.solve_linear_system(copy)
+            self._record(variant.label, reference, rhs, *outcome)
+        solution, status = self.delegate.solve_linear_system(linear_system)
+        self._record("run", reference, rhs, solution, status)
+        self.replayed += 1
+        if self.replayed == self.num_systems:
+            raise _ReplayDone()
+        return solution, status
+
+    def _record(self, label, matrix, rhs, solution, status) -> None:
+        finite = bool(np.all(np.isfinite(solution)))
+        residual = np.linalg.norm(rhs - matrix @ solution) if finite else np.inf
+        entry = {
+            "system": self.replayed,
+            "label": label,
+            "time": self.model.time_manager.time,
+            "dt": self.model.time_manager.dt,
+            "status": type(status).__name__,
+            "krylov_iterations": getattr(status, "num_krylov_iters", None),
+            "solve_time": getattr(status, "solve_time", None),
+            "relative_residual": residual / np.linalg.norm(rhs),
+            "backward_error": backward_error(matrix, rhs, solution)
+            if finite
+            else np.inf,
+            "update_inf": float(np.max(np.abs(solution))) if finite else np.inf,
+        }
+        logger.info("Replay %s", json.dumps(entry, default=_json_default))
+        self._write(entry)
+
+    def _write(self, entry: dict[str, Any]) -> None:
+        with self.path.open("a") as file:
+            file.write(json.dumps(entry, default=_json_default) + "\n")
+
+
+@contextmanager
+def _fixed_stress_scaled(factor: float) -> Iterator[None]:
+    """Scale ``pp_solvers``' fixed-stress term, matrix and fractures alike, by a factor.
+
+    The term is assembled when the preconditioner is built, inside the solve, through
+    the two module-level functions replaced here.
+
+    """
+    import pp_solvers.fixed_stress as fixed_stress
+
+    names = (
+        "get_fixed_stress_stabilization_porous_media",
+        "get_fixed_stress_stabilization_fractures",
+    )
+    originals = {name: getattr(fixed_stress, name) for name in names}
+    for name, original in originals.items():
+        setattr(
+            fixed_stress,
+            name,
+            lambda model, original=original: factor * original(model),
+        )
+    try:
+        yield
+    finally:
+        for name, original in originals.items():
+            setattr(fixed_stress, name, original)
+
+
+def _fixed_stress_against_pressure(model, linear_system) -> dict[str, Any]:
+    """Size of the fixed-stress term relative to the mass balance's pressure diagonal.
+
+    Per subdomain dimension (matrix and fractures): the quantiles of the ratio, cell by
+    cell, and the fraction of cells where the term vanishes or is negative.
+
+    """
+    import pp_solvers.fixed_stress as fixed_stress
+
+    blocks = _block_indices(linear_system)
+    terms = {
+        model.nd: fixed_stress.get_fixed_stress_stabilization_porous_media,
+        model.nd - 1: fixed_stress.get_fixed_stress_stabilization_fractures,
+    }
+    report = {}
+    for dim, term in terms.items():
+        grids = model.mdg.subdomains(dim=dim)
+        rows = np.concatenate(
+            [blocks[f"row|mass_balance_equation|{dim}|{sd.id}"] for sd in grids]
+        )
+        columns = np.concatenate(
+            [blocks[f"col|pressure|{dim}|{sd.id}"] for sd in grids]
+        )
+        diagonal = np.abs(linear_system.matrix[rows][:, columns].diagonal())
+        stabilisation = term(model).diagonal()
+        ratio = np.abs(stabilisation) / np.maximum(diagonal, 1e-300)
+        report[str(dim)] = {
+            "ratio_quantiles_0_10_50_90_100": np.quantile(ratio, [0, 0.1, 0.5, 0.9, 1]),
+            "zero_fraction": float(np.mean(stabilisation == 0)),
+            "negative_fraction": float(np.mean(stabilisation < 0)),
+        }
+    return report
+
+
 def _linear_solver(variant: Variant, nonlinear_solver) -> pp.solvers.LinearSolverBase:
     """The linear solver a variant asks for; the script's own for ``"as_given"``."""
     choice = variant.linear_solver
@@ -487,23 +687,28 @@ def _linear_solver(variant: Variant, nonlinear_solver) -> pp.solvers.LinearSolve
     if choice == "pypardiso":
         return build_linear_solver("pypardiso", False, {}).delegate
     if choice in ("thm_factory", "system_amg"):
-        # Imported from the script's own tree, so that the factory and the PETSc
-        # options are the ones the script uses.
-        import pp_solvers
-        from nl_params import thm_factory_system_amg
-        from solver_configurations import linear_solver_params
-
-        factory = (
-            thm_factory_system_amg if choice == "system_amg" else pp_solvers.thm_factory
-        )
-        options = dict(linear_solver_params)
-        for key, values in changes.items():
-            options[key] = {**options.get(key, {}), **values}
-        return pp_solvers.IterativeLinearSolver(
-            configuration_factory=factory, solver_options=options
-        )
+        return _petsc_solver(choice, changes)
     raise ValueError(
         f"Unknown linear solver {choice!r}, expected one of {LINEAR_SOLVERS}."
+    )
+
+
+def _petsc_solver(choice: str, changes: dict[str, dict[str, Any]]):
+    """One of the scripts' two PETSc solvers, with their options changed as given."""
+    # Imported from the script's own tree, so that the factory and the PETSc options
+    # are the ones the script uses.
+    import pp_solvers
+    from nl_params import thm_factory_system_amg
+    from solver_configurations import linear_solver_params
+
+    factory = (
+        thm_factory_system_amg if choice == "system_amg" else pp_solvers.thm_factory
+    )
+    options = dict(linear_solver_params)
+    for key, values in changes.items():
+        options[key] = {**options.get(key, {}), **values}
+    return pp_solvers.IterativeLinearSolver(
+        configuration_factory=factory, solver_options=options
     )
 
 
@@ -630,6 +835,9 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--stop-at-step-cut", action="store_true")
     parser.add_argument("--dump-systems-min-dt", type=float)
     parser.add_argument("--solver-options", type=json.loads)
+    parser.add_argument("--replay", type=json.loads)
+    parser.add_argument("--replay-min-dt", type=float, default=0.0)
+    parser.add_argument("--replay-systems", type=int, default=3)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -646,6 +854,9 @@ def _parse_arguments() -> tuple[Variant, Path]:
         stop_at_step_cut=arguments.stop_at_step_cut,
         dump_systems_min_dt=arguments.dump_systems_min_dt,
         solver_options=arguments.solver_options,
+        replay=arguments.replay,
+        replay_min_dt=arguments.replay_min_dt,
+        replay_systems=arguments.replay_systems,
     )
     return variant, arguments.directory.resolve()
 
