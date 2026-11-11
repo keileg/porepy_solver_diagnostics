@@ -44,6 +44,7 @@ import numpy as np
 import porepy as pp
 import porepy.applications.initialization.initialization as initialization_module
 from porepy.applications.initialization.model_state_storage import ModelStateStorage
+from porepy.time_stepper.time_step_status import TimeStepperStatusSuccess
 
 from solver_experiments.case import ADMISSIBILITY_BOUNDS
 from solver_experiments.instrumentation import (
@@ -82,6 +83,9 @@ class Variant:
         steady_state: A ``steady_state.npz`` saved by an earlier run's
             initialisation, to start from instead of time stepping to a steady state.
             The pipeline still validates it against this run's model.
+        stop_at_step_cut: Stop after the first accepted time step that needed more
+            than one attempt, i.e. after the first cut of dt, in whichever phase it
+            happens. Nothing is stored as a steady state.
         gmres_restart: GMRES restart length of the outer solve, replacing PETSc's
             default as set by ``pp_solvers``; only for ``"thm_factory"`` and
             ``"system_amg"``. None keeps the script's options.
@@ -95,6 +99,7 @@ class Variant:
     mesh_only: bool = False
     steady_state: Path | None = None
     gmres_restart: int | None = None
+    stop_at_step_cut: bool = False
 
 
 @dataclass
@@ -115,6 +120,51 @@ class _MeshOnlyDone(Exception):
     """Raised to leave the script once the prepared model has been inspected."""
 
 
+class _StoppedAtStepCut(Exception):
+    """Raised to leave the script after the first time step that needed a retry."""
+
+
+class _StopAtStepCut(pp.models.model_runner.EarlyStopCriterion):
+    """Stop at the first accepted time step that needed more than one attempt.
+
+    Only the time stepper sees the attempts, so this stands in for its telemetry
+    recorder and forwards everything to the real one. Stopping raises instead of
+    returning a status, since a success status would make the initialisation store
+    the state as its steady state.
+
+    Parameters:
+        recorder: The time stepper's telemetry recorder.
+
+    """
+
+    def __init__(self, recorder) -> None:
+        self.recorder = recorder
+        self.last_status = None
+
+    def __getattr__(self, name: str):
+        return getattr(self.recorder, name)
+
+    def record_time_step(self, model, status) -> None:
+        self.recorder.record_time_step(model, status)
+        self.last_status = status
+
+    def simulation_should_stop(self, model):
+        status = self.last_status
+        if isinstance(status, TimeStepperStatusSuccess) and len(status.attempts) > 1:
+            dts = ", ".join(f"{attempt.dt:.3g}" for attempt in status.attempts)
+            now = model.time_manager.time
+            raise _StoppedAtStepCut(f"time {now:.4g} reached with dt {dts}")
+        return pp.models.model_runner.EarlyStopNotRequested()
+
+
+def _watched(variant: Variant, recorder, criteria: list) -> tuple[Any, list]:
+    """The time stepper's recorder and the early-stop criteria for a variant."""
+    if not variant.stop_at_step_cut:
+        return recorder, criteria
+    watch = _StopAtStepCut(recorder)
+    return watch, [*criteria, watch]
+
+
 def run(variant: Variant, directory: Path) -> RunRecord:
     """Run one variant of a runscript in its own directory.
 
@@ -132,7 +182,7 @@ def run(variant: Variant, directory: Path) -> RunRecord:
     _install_hooks(variant, directory, record)
     try:
         _execute(tree / f"{variant.script}.py", directory)
-    except _MeshOnlyDone:
+    except (_MeshOnlyDone, _StoppedAtStepCut):
         pass
     finally:
         # ru_maxrss is in kilobytes on Linux.
@@ -226,25 +276,32 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
         ):
             self._phase: _Phase | None = None
             if initialization_phase:
-                super().__init__(
-                    model, params, time_stepper, nonlinear_solver, early_stop_criteria
+                recorder, criteria = _watched(
+                    variant,
+                    initialization_phase[0].recorder,
+                    list(early_stop_criteria or []),
                 )
-                self.time_stepper.telemetry = initialization_phase[0].recorder
+                super().__init__(
+                    model, params, time_stepper, nonlinear_solver, criteria
+                )
+                self.time_stepper.telemetry = recorder
                 return
             self._phase = _Phase("main", variant, directory, model)
             nonlinear_solver = self._phase.instrument(nonlinear_solver)
             assert time_stepper is not None, "The runscripts pass their own stepper."
-            time_stepper.telemetry = self._phase.recorder
+            recorder, criteria = _watched(
+                variant,
+                self._phase.recorder,
+                [*(early_stop_criteria or []), *_stop_criteria(variant)],
+            )
+            time_stepper.telemetry = recorder
             self._timers = AssemblyTimers()
             super().__init__(
                 model,
                 params=params,
                 time_stepper=time_stepper,
                 nonlinear_solver=nonlinear_solver,
-                early_stop_criteria=[
-                    *(early_stop_criteria or []),
-                    *_stop_criteria(variant),
-                ],
+                early_stop_criteria=criteria,
             )
             record.model_size = _model_size(model)
             record.wells = _well_connections(model)
@@ -483,6 +540,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--mesh-only", action="store_true")
     parser.add_argument("--steady-state", type=Path)
     parser.add_argument("--gmres-restart", type=int)
+    parser.add_argument("--stop-at-step-cut", action="store_true")
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -496,6 +554,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         if arguments.steady_state is None
         else arguments.steady_state.resolve(),
         gmres_restart=arguments.gmres_restart,
+        stop_at_step_cut=arguments.stop_at_step_cut,
     )
     return variant, arguments.directory.resolve()
 
