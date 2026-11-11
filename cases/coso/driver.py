@@ -86,6 +86,9 @@ class Variant:
         stop_at_step_cut: Stop after the first accepted time step that needed more
             than one attempt, i.e. after the first cut of dt, in whichever phase it
             happens. Nothing is stored as a steady state.
+        dump_systems_min_dt: Save every linear system solved at a time step of at
+            least this size [s], with its solution and index maps, under
+            ``systems_{phase}/``; None saves none.
         gmres_restart: GMRES restart length of the outer solve, replacing PETSc's
             default as set by ``pp_solvers``; only for ``"thm_factory"`` and
             ``"system_amg"``. None keeps the script's options.
@@ -100,6 +103,7 @@ class Variant:
     steady_state: Path | None = None
     gmres_restart: int | None = None
     stop_at_step_cut: bool = False
+    dump_systems_min_dt: float | None = None
 
 
 @dataclass
@@ -366,6 +370,12 @@ class _Phase:
         )
         self.linear_solver = InstrumentedSolver(delegate)
         nonlinear_solver.linear_solver = self.linear_solver
+        if self.variant.dump_systems_min_dt is not None:
+            nonlinear_solver.linear_solver = _SystemDump(
+                self.linear_solver,
+                self.directory / f"systems_{self.name}",
+                self.variant.dump_systems_min_dt,
+            )
         nonlinear_solver.telemetry = self.recorder
         return nonlinear_solver
 
@@ -394,6 +404,74 @@ class _Phase:
                 metrics.as_dict(), indent=2, sort_keys=True, default=_json_default
             )
         )
+
+
+class _SystemDump(pp.solvers.LinearSolverBase):
+    """Save the linear systems of a run with their solutions, for offline analysis.
+
+    Each system goes to ``system_NNN.npz`` (matrix, right-hand side, solution, Krylov
+    iterations, status, time and dt). The row and column indices of every equation and
+    variable on every grid go to ``blocks.npz`` once, keyed ``row|name|dim|id`` and
+    ``col|name|dim|id``.
+
+    Parameters:
+        delegate: The solver doing the actual work.
+        directory: Where to save; created.
+        min_dt: Only systems solved at a time step of at least this size are saved.
+
+    """
+
+    def __init__(self, delegate, directory: Path, min_dt: float) -> None:
+        self.delegate = delegate
+        self.directory = directory
+        self.min_dt = min_dt
+        self.model = None
+        self.count = 0
+
+    def initialize_with_model(self, model) -> None:
+        self.model = model
+        self.delegate.initialize_with_model(model)
+
+    def solve_linear_system(self, linear_system):
+        matrix = linear_system.matrix
+        solution, status = self.delegate.solve_linear_system(linear_system)
+        dt = self.model.time_manager.dt
+        if dt >= self.min_dt:
+            self._save(linear_system, matrix, solution, status, dt)
+        return solution, status
+
+    def _save(self, linear_system, matrix, solution, status, dt) -> None:
+        if self.count == 0:
+            self.directory.mkdir()
+            np.savez(self.directory / "blocks.npz", **_block_indices(linear_system))
+        matrix = matrix.tocsr()
+        np.savez(
+            self.directory / f"system_{self.count:03d}.npz",
+            data=matrix.data,
+            indices=matrix.indices,
+            indptr=matrix.indptr,
+            shape=np.array(matrix.shape),
+            rhs=linear_system.rhs,
+            solution=solution,
+            krylov_iterations=getattr(status, "num_krylov_iters", -1),
+            status=type(status).__name__,
+            time=self.model.time_manager.time,
+            dt=dt,
+        )
+        self.count += 1
+
+
+def _block_indices(linear_system) -> dict[str, np.ndarray]:
+    """Rows of each equation and columns of each variable, per grid."""
+    blocks = {}
+    for kind, indexer in (
+        ("row", linear_system.equation_indexer),
+        ("col", linear_system.variable_indexer),
+    ):
+        for name, per_grid in indexer.group_by_name().items():
+            for grid, indices in per_grid.items():
+                blocks[f"{kind}|{name}|{grid.dim}|{grid.id}"] = np.asarray(indices)
+    return blocks
 
 
 def _linear_solver(
@@ -541,6 +619,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--steady-state", type=Path)
     parser.add_argument("--gmres-restart", type=int)
     parser.add_argument("--stop-at-step-cut", action="store_true")
+    parser.add_argument("--dump-systems-min-dt", type=float)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -555,6 +634,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         else arguments.steady_state.resolve(),
         gmres_restart=arguments.gmres_restart,
         stop_at_step_cut=arguments.stop_at_step_cut,
+        dump_systems_min_dt=arguments.dump_systems_min_dt,
     )
     return variant, arguments.directory.resolve()
 
