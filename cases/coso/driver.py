@@ -86,6 +86,9 @@ class Variant:
         stop_at_step_cut: Stop after the first accepted time step that needed more
             than one attempt, i.e. after the first cut of dt, in whichever phase it
             happens. Nothing is stored as a steady state.
+        solver_options: PETSc options merged into the script's, per solver key (e.g.
+            ``{"mechanics_amg": {"ksp_type": "gmres"}}``); only for
+            ``"thm_factory"`` and ``"system_amg"``.
         dump_systems_min_dt: Save every linear system solved at a time step of at
             least this size [s], with its solution and index maps, under
             ``systems_{phase}/``; None saves none.
@@ -104,6 +107,7 @@ class Variant:
     gmres_restart: int | None = None
     stop_at_step_cut: bool = False
     dump_systems_min_dt: float | None = None
+    solver_options: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass
@@ -365,9 +369,7 @@ class _Phase:
 
     def instrument(self, nonlinear_solver):
         """Swap the linear solver if asked, and wrap it; attach the recorder."""
-        delegate = _linear_solver(
-            self.variant.linear_solver, nonlinear_solver, self.variant.gmres_restart
-        )
+        delegate = _linear_solver(self.variant, nonlinear_solver)
         self.linear_solver = InstrumentedSolver(delegate)
         nonlinear_solver.linear_solver = self.linear_solver
         if self.variant.dump_systems_min_dt is not None:
@@ -474,12 +476,12 @@ def _block_indices(linear_system) -> dict[str, np.ndarray]:
     return blocks
 
 
-def _linear_solver(
-    choice: str, nonlinear_solver, gmres_restart: int | None
-) -> pp.solvers.LinearSolverBase:
+def _linear_solver(variant: Variant, nonlinear_solver) -> pp.solvers.LinearSolverBase:
     """The linear solver a variant asks for; the script's own for ``"as_given"``."""
-    if gmres_restart is not None and choice not in ("thm_factory", "system_amg"):
-        raise ValueError(f"A GMRES restart needs a PETSc solver, not {choice!r}.")
+    choice = variant.linear_solver
+    changes = _option_changes(variant)
+    if changes and choice not in ("thm_factory", "system_amg"):
+        raise ValueError(f"PETSc options need a PETSc solver, not {choice!r}.")
     if choice == "as_given":
         return nonlinear_solver.linear_solver
     if choice == "pypardiso":
@@ -495,17 +497,24 @@ def _linear_solver(
             thm_factory_system_amg if choice == "system_amg" else pp_solvers.thm_factory
         )
         options = dict(linear_solver_params)
-        if gmres_restart is not None:
-            options["gmres"] = {
-                **options.get("gmres", {}),
-                "ksp_gmres_restart": gmres_restart,
-            }
+        for key, values in changes.items():
+            options[key] = {**options.get(key, {}), **values}
         return pp_solvers.IterativeLinearSolver(
             configuration_factory=factory, solver_options=options
         )
     raise ValueError(
         f"Unknown linear solver {choice!r}, expected one of {LINEAR_SOLVERS}."
     )
+
+
+def _option_changes(variant: Variant) -> dict[str, dict[str, Any]]:
+    """The PETSc options a variant changes, per solver key."""
+    changes = {
+        key: dict(values) for key, values in (variant.solver_options or {}).items()
+    }
+    if variant.gmres_restart is not None:
+        changes.setdefault("gmres", {})["ksp_gmres_restart"] = variant.gmres_restart
+    return changes
 
 
 class _StopAfter(pp.models.model_runner.EarlyStopCriterion):
@@ -620,6 +629,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--gmres-restart", type=int)
     parser.add_argument("--stop-at-step-cut", action="store_true")
     parser.add_argument("--dump-systems-min-dt", type=float)
+    parser.add_argument("--solver-options", type=json.loads)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -635,6 +645,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         gmres_restart=arguments.gmres_restart,
         stop_at_step_cut=arguments.stop_at_step_cut,
         dump_systems_min_dt=arguments.dump_systems_min_dt,
+        solver_options=arguments.solver_options,
     )
     return variant, arguments.directory.resolve()
 
