@@ -48,6 +48,8 @@ class SolveRecord:
     solve_times: list[float] = field(default_factory=list)
     backward_errors: list[float] = field(default_factory=list)
     update_norms: list[float] = field(default_factory=list)
+    krylov_iterations: list[int | None] = field(default_factory=list)
+    """Iterations of each solve, or None for a solver that does not report them."""
     num_failures: int = 0
 
     def summary(self) -> dict[str, Any]:
@@ -62,6 +64,7 @@ class SolveRecord:
             "median_backward_error": float(np.median(self.backward_errors)),
             "max_update_norm": float(np.max(self.update_norms)),
             "num_failures": self.num_failures,
+            "krylov_iterations": self.krylov_iterations,
         }
 
 
@@ -114,6 +117,7 @@ class InstrumentedSolver(pp.solvers.LinearSolverBase):
         t_0 = time.time()
         solution, status = self.delegate.solve_linear_system(linear_system)
         self.record.solve_times.append(time.time() - t_0)
+        self.record.krylov_iterations.append(getattr(status, "num_krylov_iters", None))
         if status.is_failure():
             self.record.num_failures += 1
             self.record.backward_errors.append(np.inf)
@@ -123,10 +127,12 @@ class InstrumentedSolver(pp.solvers.LinearSolverBase):
             self.record.backward_errors.append(backward_error(matrix, rhs, solution))
             self.record.update_norms.append(float(np.max(np.abs(solution))))
         logger.info(
-            "Linear solve: %.2e s, backward error %.2e, ||update||_inf %.2e",
+            "Linear solve: %.2e s, backward error %.2e, ||update||_inf %.2e, "
+            "Krylov iterations %s",
             self.record.solve_times[-1],
             self.record.backward_errors[-1],
             self.record.update_norms[-1],
+            self.record.krylov_iterations[-1],
         )
         return solution, status
 
