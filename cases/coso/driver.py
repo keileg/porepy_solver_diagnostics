@@ -108,6 +108,9 @@ class Variant:
             ``"thm_factory"`` and ``"system_amg"``. None replays nothing.
         replay_min_dt: Smallest time step [s] whose systems are replayed.
         replay_systems: Number of systems to replay; the run stops after the last.
+        wells_to_first_fracture: Names of wells to end at their shallowest fracture
+            crossing instead of the script's trimming, so that each meets one fracture
+            only (see :func:`_end_wells_at_first_fracture`). Only for ``runscript_3``.
 
     """
 
@@ -124,6 +127,7 @@ class Variant:
     replay: list[dict[str, Any]] | None = None
     replay_min_dt: float = 0.0
     replay_systems: int = 3
+    wells_to_first_fracture: list[str] | None = None
 
 
 @dataclass
@@ -262,6 +266,8 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
     initialization_phase: list[_Phase] = []
 
     def instrumented_pipeline(model, *args, nonlinear_solver=None, **kwargs):
+        if variant.wells_to_first_fracture:
+            _end_wells_at_first_fracture(model, variant.wells_to_first_fracture)
         if variant.cap:
             model.params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
         if variant.steady_state is not None:
@@ -354,6 +360,42 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
 
     initialization_module.initialization_pipeline = instrumented_pipeline
     pp.ModelRunner = InstrumentedModelRunner  # type: ignore[misc]
+
+
+def _end_wells_at_first_fracture(model, names: list[str]) -> None:
+    """End the named wells exactly at their shallowest fracture crossing.
+
+    ``runscript_3``'s geometry trims each well below its deepest crossing, so a well
+    crossing several fractures connects them. Ending it at the first crossing leaves it
+    touching one fracture only, as in the other runscripts. The geometry class is
+    patched, not the model instance: the pipeline prepares the model more than once.
+
+    """
+    geometry = next(
+        (c for c in type(model).__mro__ if c.__name__ == "TrimmedWellsFaultGeometry"),
+        None,
+    )
+    if geometry is None:
+        raise ValueError("Only runscript_3's geometry can end wells at a fracture.")
+    trimmed = geometry.set_well_network
+
+    def set_well_network(self) -> None:
+        trimmed(self)
+        wells = []
+        for well in self.well_network.wells:
+            if well.tags.get("well_name") in names:
+                top, bottom = well.pts[:, 0], well.pts[:, -1]
+                crossings = [
+                    self._segment_fracture_intersection(top, bottom, fracture.pts)
+                    for fracture in self._fractures
+                ]
+                first = min(t for t in crossings if t is not None)
+                pts = np.column_stack([top, top + first * (bottom - top)])
+                well = pp.Well(pts, tags=dict(well.tags))
+            wells.append(well)
+        self.well_network = pp.WellNetwork3d(domain=self._domain, wells=wells)
+
+    geometry.set_well_network = set_well_network
 
 
 def _private_copy(steady_state: Path, directory: Path) -> ModelStateStorage:
@@ -838,6 +880,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--replay", type=json.loads)
     parser.add_argument("--replay-min-dt", type=float, default=0.0)
     parser.add_argument("--replay-systems", type=int, default=3)
+    parser.add_argument("--wells-to-first-fracture", action="append")
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -857,6 +900,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         replay=arguments.replay,
         replay_min_dt=arguments.replay_min_dt,
         replay_systems=arguments.replay_systems,
+        wells_to_first_fracture=arguments.wells_to_first_fracture,
     )
     return variant, arguments.directory.resolve()
 
