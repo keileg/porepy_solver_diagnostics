@@ -111,6 +111,20 @@ class Variant:
         wells_to_first_fracture: Names of wells to end at their shallowest fracture
             crossing instead of the script's trimming, so that each meets one fracture
             only (see :func:`_end_wells_at_first_fracture`). Only for ``runscript_3``.
+        log_well: Name of a well whose state is written at every Newton iteration, to
+            ``well_log.jsonl`` (see :func:`_install_well_log`). None logs nothing.
+        max_failed_attempts: Stop once this many time-step attempts have failed in
+            total, over both phases. None never stops for that reason.
+        steps_after_cut: Stop once this many time steps have been accepted after the
+            first accepted step that needed a cut of dt. None never stops for that
+            reason.
+        initialize_without_wells: Run the initialisation on the model with all wells
+            left out, save its steady state for a full model to start from
+            (``state_without_wells.npz``, see :func:`_save_state_without_wells`), and
+            stop.
+        state_without_wells: A ``state_without_wells.npz`` to start the full model
+            from, instead of initialising it (see
+            :func:`_start_from_state_without_wells`).
 
     """
 
@@ -128,6 +142,11 @@ class Variant:
     replay_min_dt: float = 0.0
     replay_systems: int = 3
     wells_to_first_fracture: list[str] | None = None
+    log_well: str | None = None
+    max_failed_attempts: int | None = None
+    steps_after_cut: int | None = None
+    initialize_without_wells: bool = False
+    state_without_wells: Path | None = None
 
 
 @dataclass
@@ -142,6 +161,7 @@ class RunRecord:
     main_status: str | None = None
     phases_done: list[str] = field(default_factory=list)
     peak_memory_gb: float | None = None
+    stop_rule: str | None = None
 
 
 class _MeshOnlyDone(Exception):
@@ -150,6 +170,14 @@ class _MeshOnlyDone(Exception):
 
 class _StoppedAtStepCut(Exception):
     """Raised to leave the script after the first time step that needed a retry."""
+
+
+class _StopRuleMet(Exception):
+    """Raised when a run's stop rule (failed attempts, steps after a cut) is met."""
+
+
+class _InitializationOnlyDone(Exception):
+    """Raised after the well-free initialisation has saved its state."""
 
 
 class _ReplayDone(Exception):
@@ -214,7 +242,13 @@ def run(variant: Variant, directory: Path) -> RunRecord:
     _install_hooks(variant, directory, record)
     try:
         _execute(tree / f"{variant.script}.py", directory)
-    except (_MeshOnlyDone, _StoppedAtStepCut, _ReplayDone):
+    except (
+        _MeshOnlyDone,
+        _StoppedAtStepCut,
+        _ReplayDone,
+        _StopRuleMet,
+        _InitializationOnlyDone,
+    ):
         pass
     finally:
         # ru_maxrss is in kilobytes on Linux.
@@ -270,6 +304,17 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             _end_wells_at_first_fracture(model, variant.wells_to_first_fracture)
         if variant.cap:
             model.params["variable_bounds"] = dict(ADMISSIBILITY_BOUNDS)
+        if variant.log_well is not None:
+            _install_well_log(
+                model, variant.log_well, directory / "well_log.jsonl", record
+            )
+        _install_stop_rule(model, variant, record)
+        if variant.initialize_without_wells:
+            _leave_wells_out(model)
+        if variant.state_without_wells is not None:
+            _start_from_state_without_wells(model, variant.state_without_wells)
+            record.phases_done.append("initialization")
+            return model
         if variant.steady_state is not None:
             kwargs["storage"] = _private_copy(variant.steady_state, directory)
         if variant.mesh_only:
@@ -285,9 +330,12 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
         success, failure_reason = True, None
         t_0 = time.time()
         try:
-            return original_pipeline(
+            initialized = original_pipeline(
                 model, *args, nonlinear_solver=nonlinear_solver, **kwargs
             )
+            if variant.initialize_without_wells:
+                _save_state_without_wells(initialized, directory)
+            return initialized
         except Exception as error:
             success, failure_reason = False, f"{type(error).__name__}: {error}"
             raise
@@ -296,6 +344,8 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             timers.run_time = record.initialization_time = time.time() - t_0
             phase.write_metrics(success, failure_reason, timers)
             record.phases_done.append("initialization")
+            if success and variant.initialize_without_wells:
+                raise _InitializationOnlyDone
 
     class InstrumentedModelRunner(pp.ModelRunner):
         """Model runner whose nonlinear solver and time stepper are instrumented."""
@@ -360,6 +410,305 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
 
     initialization_module.initialization_pipeline = instrumented_pipeline
     pp.ModelRunner = InstrumentedModelRunner  # type: ignore[misc]
+
+
+def _class_method(model, name: str):
+    """The model's method ``name`` as its class defines it now.
+
+    Hooks set on the model instance must not capture the bound method when they are
+    installed: the initialisation pipeline swaps the model's class for a simplified
+    one while it time steps, and that class overrides some of these methods.
+
+    """
+    return getattr(type(model), name).__get__(model)
+
+
+def _install_stop_rule(model, variant: Variant, record: RunRecord) -> None:
+    """Stop the run by ``max_failed_attempts`` or ``steps_after_cut``.
+
+    Counted through the model's own hooks, which see every attempt: a failed attempt
+    ends in ``after_nonlinear_failure``, an accepted step in
+    ``after_nonlinear_convergence``. Both phases share the model, so the counts run
+    over the initialisation and the main run together.
+
+    """
+    if variant.max_failed_attempts is None and variant.steps_after_cut is None:
+        return
+    counts = {"failed": 0, "failed_in_step": 0, "after_cut": None}
+
+    def stop(reason: str) -> None:
+        record.stop_rule = reason
+        raise _StopRuleMet(reason)
+
+    def count_failure(*args, **kwargs):
+        _class_method(model, "after_nonlinear_failure")(*args, **kwargs)
+        counts["failed"] += 1
+        counts["failed_in_step"] += 1
+        limit = variant.max_failed_attempts
+        if limit is not None and counts["failed"] >= limit:
+            now = model.time_manager.time
+            stop(f"{counts['failed']} failed attempts, t = {now:.4g}")
+
+    def count_step(*args, **kwargs):
+        _class_method(model, "after_nonlinear_convergence")(*args, **kwargs)
+        if counts["after_cut"] is not None:
+            counts["after_cut"] += 1
+        elif counts["failed_in_step"] > 0:
+            counts["after_cut"] = 0
+        counts["failed_in_step"] = 0
+        limit = variant.steps_after_cut
+        if limit is not None and counts["after_cut"] is not None:
+            if counts["after_cut"] >= limit:
+                now = model.time_manager.time
+                stop(f"{limit} steps after the first cut, t = {now:.4g}")
+
+    model.after_nonlinear_failure = count_failure
+    model.after_nonlinear_convergence = count_step
+
+
+def _install_well_log(model, name: str, path: Path, record: RunRecord) -> None:
+    """Write one well's state at the start of each step and after every iteration.
+
+    Per record: the phase, time, dt and iteration; the well's cell depths and
+    temperatures, its face Darcy fluxes (the sign gives the upwind direction) with
+    the face depths; for each of its 0-d junctions, the temperature, the Darcy flux
+    on the well-junction interface and the well flux on the junction-fracture
+    interface. Fluxes in model units.
+
+    """
+    state = {"iteration": 0}
+    log = path.open("a")
+
+    def other(intf, grid):
+        primary, secondary = model.mdg.interface_to_subdomain_pair(intf)
+        return secondary if primary is grid else primary
+
+    def grids():
+        # Looked up again whenever the model is prepared anew (a new md-grid), as the
+        # pipeline does for the main run after the initialisation.
+        if state.get("mdg") is not model.mdg:
+            mdg = model.mdg
+            well = next(
+                sd
+                for sd in mdg.subdomains(dim=1)
+                if model.is_well_grid(sd)
+                and model.parent_well(sd).tags.get("well_name") == name
+            )
+            junction_interfaces = [
+                intf
+                for intf in mdg.subdomain_to_interfaces(well)
+                if other(intf, well).dim == 0
+            ]
+            junctions = [other(intf, well) for intf in junction_interfaces]
+            fracture_interfaces = [
+                [
+                    intf
+                    for intf in mdg.subdomain_to_interfaces(junction)
+                    if other(intf, junction).dim == model.nd - 1
+                ]
+                for junction in junctions
+            ]
+            state.update(
+                mdg=mdg,
+                well=well,
+                junctions=junctions,
+                junction_interfaces=junction_interfaces,
+                fracture_interfaces=fracture_interfaces,
+            )
+        return state
+
+    def values(operator) -> list[float]:
+        return np.atleast_1d(operator.value(model.equation_system)).tolist()
+
+    def write() -> None:
+        g = grids()
+        well = g["well"]
+        junctions = []
+        for junction, intf, fracture_intfs in zip(
+            g["junctions"], g["junction_interfaces"], g["fracture_interfaces"]
+        ):
+            junctions.append(
+                {
+                    "z": float(junction.cell_centers[2, 0]),
+                    "T": values(model.temperature([junction]))[0],
+                    "well_junction_darcy_flux": values(
+                        model.interface_darcy_flux([intf])
+                    ),
+                    "junction_fracture_well_flux": values(
+                        model.well_flux(fracture_intfs)
+                    )
+                    if fracture_intfs
+                    else [],
+                }
+            )
+        phase = "main" if "initialization" in record.phases_done else "initialization"
+        entry = {
+            "phase": phase,
+            "time": model.time_manager.time,
+            "dt": model.time_manager.dt,
+            "iteration": state["iteration"],
+            "cell_z": well.cell_centers[2].tolist(),
+            "cell_T": values(model.temperature([well])),
+            "face_z": well.face_centers[2].tolist(),
+            "face_darcy_flux": values(model.darcy_flux([well])),
+            "junctions": junctions,
+        }
+        log.write(json.dumps(entry) + "\n")
+        log.flush()
+
+    def log_step_start(*args, **kwargs):
+        _class_method(model, "before_nonlinear_loop")(*args, **kwargs)
+        state["iteration"] = 0
+        write()
+
+    def log_iteration(*args, **kwargs):
+        _class_method(model, "after_nonlinear_iteration")(*args, **kwargs)
+        state["iteration"] += 1
+        write()
+
+    model.before_nonlinear_loop = log_step_start
+    model.after_nonlinear_iteration = log_iteration
+
+
+STATE_WITHOUT_WELLS = "state_without_wells.npz"
+
+
+def _leave_wells_out(model) -> None:
+    """Give the model an empty well network: no well, junction or well interface.
+
+    The class is patched, not the instance, since the pipeline prepares the model more
+    than once. The matrix and fracture meshes do not depend on the wells (the gmsh
+    file is identical whatever the wells), so the state found without wells fits a
+    full model's matrix and fractures.
+
+    """
+    geometry = next(
+        (c for c in type(model).__mro__ if "set_well_network" in c.__dict__), None
+    )
+    if geometry is None:
+        raise ValueError("The model has no well network to leave out.")
+
+    def set_well_network(self) -> None:
+        self.well_network = pp.WellNetwork3d(domain=self._domain, wells=[])
+
+    geometry.set_well_network = set_well_network
+
+
+def _grid_signature(grid) -> tuple:
+    """A key identifying a grid by its geometry, the same in two models.
+
+    Grid ids and positions in the md-grid differ between a model with wells and one
+    without, so grids are matched by dimension, size and cell-centre centroid.
+
+    """
+    centers = np.asarray(grid.cell_centers)
+    centroid = (
+        tuple(np.round(centers.mean(axis=1), 3).tolist()) if grid.num_cells else ()
+    )
+    return (type(grid).__name__, int(grid.dim), int(grid.num_cells), centroid)
+
+
+def _signatures(model) -> dict[str, list[tuple]]:
+    """Grid signatures by grid type, in the order :class:`ModelStateStorage` uses.
+
+    An interface's signature includes those of its two subdomains, and a boundary
+    grid's that of its parent: the two mortar grids of a fracture intersection line
+    have the same geometry and differ only in the fracture on their other side.
+
+    """
+    mdg = model.mdg
+    subdomain = {sd: _grid_signature(sd) for sd in mdg.subdomains()}
+    return {
+        "sd": list(subdomain.values()),
+        "intf": [
+            _grid_signature(intf)
+            + tuple(subdomain[sd] for sd in mdg.interface_to_subdomain_pair(intf))
+            for intf in mdg.interfaces()
+        ],
+        "bg": [
+            _grid_signature(bg) + (subdomain[bg.parent],) for bg in mdg.boundaries()
+        ],
+    }
+
+
+def _save_state_without_wells(model, directory: Path) -> None:
+    """Save the initialised well-free state with the signature of every grid."""
+    arrays = ModelStateStorage(directory / STATE_WITHOUT_WELLS).capture_state(model)
+    signatures = json.dumps(_signatures(model))
+    np.savez(
+        directory / STATE_WITHOUT_WELLS,
+        __signatures__=np.array(signatures),
+        **arrays,
+    )
+    logger.info(f"Saved the well-free state to {directory / STATE_WITHOUT_WELLS}.")
+
+
+def _match_grids(
+    saved: dict[str, list], current: dict[str, list]
+) -> dict[tuple[str, int], int]:
+    """Position of each saved grid among the current ones, by signature.
+
+    Every saved grid must be found. Grids of the same signature (only empty grids,
+    e.g. boundaries of points) are matched in order.
+
+    """
+    matches: dict[tuple[str, int], int] = {}
+    for grid_type, saved_signatures in saved.items():
+        available: dict[tuple, list[int]] = {}
+        for position, signature in enumerate(current[grid_type]):
+            available.setdefault(tuple(_as_tuple(signature)), []).append(position)
+        for position, signature in enumerate(saved_signatures):
+            candidates = available.get(tuple(_as_tuple(signature)), [])
+            if not candidates:
+                raise ValueError(f"No grid in the model matches saved {signature}.")
+            if len(candidates) > 1 and signature[2] > 0:
+                raise ValueError(f"Several grids in the model match {signature}.")
+            matches[(grid_type, position)] = candidates.pop(0)
+    return matches
+
+
+def _as_tuple(value):
+    return tuple(_as_tuple(v) for v in value) if isinstance(value, list) else value
+
+
+def _start_from_state_without_wells(model, path: Path) -> None:
+    """Prepare the full model and start it from a well-free initialised state.
+
+    The matrix, fracture and intersection state (variables at all iterate and time
+    indices, boundary values, reference values) is copied from the saved state; the
+    wells, their junctions and their interfaces keep the model's initial condition.
+    The resulting state is made the reference state, as the initialisation pipeline
+    does with its steady state, so that the reference stress and porosity are those of
+    the start of the main run. The full model is not validated as a steady state: with
+    wells added it is not one.
+
+    """
+    saved = dict(np.load(path))
+    signatures = json.loads(str(saved.pop("__signatures__")))
+    times_to_export = model.params.get("times_to_export", None)
+    model.params["times_to_export"] = []
+    model.prepare_simulation()
+    model.params["times_to_export"] = times_to_export
+
+    matches = _match_grids(signatures, _signatures(model))
+    grids = ModelStateStorage._get_mdg_data(model)
+    for key, array in saved.items():
+        grid_type, position, location, name, index = ModelStateStorage._key_to_tuple(
+            key
+        )
+        _, data = grids[grid_type][matches[(grid_type, position)]]
+        stored = data.setdefault(location, {})
+        if location == pp.REFERENCE_SOLUTIONS:
+            stored[name] = array.copy()
+        else:
+            stored.setdefault(name, {})[index] = array.copy()
+    model.update_derived_quantities()
+    initialization_module._set_state_as_reference(model)
+    model.save_data_time_step()
+    logger.info(
+        f"Started from the well-free state {path}: {len(matches)} grids copied, "
+        f"wells at their initial condition."
+    )
 
 
 def _end_wells_at_first_fracture(model, names: list[str]) -> None:
@@ -881,6 +1230,11 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--replay-min-dt", type=float, default=0.0)
     parser.add_argument("--replay-systems", type=int, default=3)
     parser.add_argument("--wells-to-first-fracture", action="append")
+    parser.add_argument("--log-well")
+    parser.add_argument("--max-failed-attempts", type=int)
+    parser.add_argument("--steps-after-cut", type=int)
+    parser.add_argument("--initialize-without-wells", action="store_true")
+    parser.add_argument("--state-without-wells", type=Path)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -901,6 +1255,13 @@ def _parse_arguments() -> tuple[Variant, Path]:
         replay_min_dt=arguments.replay_min_dt,
         replay_systems=arguments.replay_systems,
         wells_to_first_fracture=arguments.wells_to_first_fracture,
+        log_well=arguments.log_well,
+        max_failed_attempts=arguments.max_failed_attempts,
+        steps_after_cut=arguments.steps_after_cut,
+        initialize_without_wells=arguments.initialize_without_wells,
+        state_without_wells=None
+        if arguments.state_without_wells is None
+        else arguments.state_without_wells.resolve(),
     )
     return variant, arguments.directory.resolve()
 
