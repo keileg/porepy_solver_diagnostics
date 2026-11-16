@@ -125,6 +125,8 @@ class Variant:
         state_without_wells: A ``state_without_wells.npz`` to start the full model
             from, instead of initialising it (see
             :func:`_start_from_state_without_wells`).
+        save_state_at: Simulated times [s] of the main run at which to save the full
+            model state, for a later run to restart from (see :class:`_SaveStateAt`).
 
     """
 
@@ -147,6 +149,7 @@ class Variant:
     steps_after_cut: int | None = None
     initialize_without_wells: bool = False
     state_without_wells: Path | None = None
+    save_state_at: list[float] | None = None
 
 
 @dataclass
@@ -376,7 +379,7 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             recorder, criteria = _watched(
                 variant,
                 self._phase.recorder,
-                [*(early_stop_criteria or []), *_stop_criteria(variant)],
+                [*(early_stop_criteria or []), *_stop_criteria(variant, directory)],
             )
             time_stepper.telemetry = recorder
             self._timers = AssemblyTimers()
@@ -1125,8 +1128,53 @@ class _StopAfter(pp.models.model_runner.EarlyStopCriterion):
         return pp.models.model_runner.EarlyStopNotRequested()
 
 
-def _stop_criteria(variant: Variant) -> list:
-    return [] if variant.stop_after is None else [_StopAfter(variant.stop_after)]
+class _SaveStateAt(pp.models.model_runner.EarlyStopCriterion):
+    """Save the model state once the main run first reaches a given time; never stop.
+
+    Checked after every time-step attempt. After a failed attempt the model is back at
+    its last accepted step, so whatever is saved is an accepted state. The saved
+    files, in the run directory, are ``state_<time>s.npz`` (every value in the grids'
+    data dictionaries, :class:`ModelStateStorage`) and ``state_<time>s.json`` (time,
+    dt and time index, which the arrays do not carry), with the time actually
+    reached.
+
+    """
+
+    def __init__(self, save_time: float, directory: Path) -> None:
+        self.save_time = save_time
+        self.directory = directory
+        self.saved = False
+
+    def simulation_should_stop(self, model):
+        time_manager = model.time_manager
+        # A time given in days need not convert exactly to the schedule point meant.
+        reached = time_manager.time >= self.save_time or np.isclose(
+            time_manager.time, self.save_time, rtol=1e-12, atol=0.0
+        )
+        if reached and not self.saved:
+            stem = self.directory / f"state_{time_manager.time:.0f}s"
+            ModelStateStorage(stem.with_suffix(".npz")).save_state(model)
+            stem.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "time": time_manager.time,
+                        "dt": time_manager.dt,
+                        "time_index": time_manager.time_index,
+                        "requested_time": self.save_time,
+                    }
+                )
+            )
+            self.saved = True
+        return pp.models.model_runner.EarlyStopNotRequested()
+
+
+def _stop_criteria(variant: Variant, directory: Path) -> list:
+    criteria: list = [
+        _SaveStateAt(save_time, directory) for save_time in variant.save_state_at or []
+    ]
+    if variant.stop_after is not None:
+        criteria.append(_StopAfter(variant.stop_after))
+    return criteria
 
 
 def _bounds_in_model_units(model) -> dict[str, tuple[float, float]]:
@@ -1235,6 +1283,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--steps-after-cut", type=int)
     parser.add_argument("--initialize-without-wells", action="store_true")
     parser.add_argument("--state-without-wells", type=Path)
+    parser.add_argument("--save-state-at-days", type=float, nargs="+")
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -1262,6 +1311,9 @@ def _parse_arguments() -> tuple[Variant, Path]:
         state_without_wells=None
         if arguments.state_without_wells is None
         else arguments.state_without_wells.resolve(),
+        save_state_at=None
+        if arguments.save_state_at_days is None
+        else [days * pp.DAY for days in arguments.save_state_at_days],
     )
     return variant, arguments.directory.resolve()
 
