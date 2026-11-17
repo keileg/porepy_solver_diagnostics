@@ -47,6 +47,7 @@ import numpy as np
 import porepy as pp
 import porepy.applications.initialization.initialization as initialization_module
 from porepy.applications.initialization.model_state_storage import ModelStateStorage
+from porepy.numerics.solvers.well_telemetry import find_well_topology
 from porepy.time_stepper.time_step_status import TimeStepperStatusSuccess
 
 from solver_experiments.case import ADMISSIBILITY_BOUNDS
@@ -133,6 +134,9 @@ class Variant:
             ``save_state_at``, to start the main run from at that time, skipping the
             initialisation (see :func:`_resume_time_stepping_at` and
             :func:`_start_from_saved_state`).
+        freeze_well_upwind_after: Newton iteration of each main-run attempt after
+            which the upwind directions in the wells and their interfaces stop being
+            updated (see :func:`_freeze_well_upwind`). None updates them as usual.
 
     """
 
@@ -157,6 +161,7 @@ class Variant:
     state_without_wells: Path | None = None
     save_state_at: list[float] | None = None
     restart_from: Path | None = None
+    freeze_well_upwind_after: int | None = None
 
 
 @dataclass
@@ -405,6 +410,12 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             )
             record.model_size = _model_size(model)
             record.wells = _well_connections(model)
+            if variant.freeze_well_upwind_after is not None:
+                _freeze_well_upwind(
+                    model,
+                    variant.freeze_well_upwind_after,
+                    directory / "frozen_upwind.jsonl",
+                )
             instrument_assembly(model, self._timers)
             count_capped_dofs(self.solver, self._timers)
 
@@ -872,6 +883,85 @@ def _restore_well_ramp_caches(model) -> None:
         f"Restored the well ramp caches: flux {model._cached_well_top_flux}, "
         f"pressure {model._cached_well_top_pressure}."
     )
+
+
+def _freeze_well_upwind(model, after: int, path: Path) -> None:
+    """Stop updating the upwind directions in the wells after a Newton iteration.
+
+    The model stores the Darcy fluxes its upwind discretisations take the sign of
+    (``update_flux_values``) at the start of each time-step attempt and after every
+    iteration. From iteration ``after`` of an attempt on, the stored fluxes of the well
+    grids and of the interfaces of the wells and their junctions are held at their
+    values after that iteration, so all later iterations of the attempt upwind in the
+    same directions. Every other grid upwinds as usual. Each held update writes to
+    ``path`` how many of the held directions the current fluxes contradict; a
+    converged attempt that contradicts none is a solution with consistent directions.
+
+    """
+    topology = find_well_topology(model)
+    if topology is None:
+        raise ValueError("The model has no wells whose upwinding could be frozen.")
+    data = [model.mdg.subdomain_data(sd) for sd in topology.wells] + [
+        model.mdg.interface_data(intf) for intf in topology.interfaces
+    ]
+    keys = model.darcy_flux_storage_keywords()
+    state: dict[str, Any] = {"iteration": 0, "held": None}
+    update_flux_values = model.update_flux_values
+    before_nonlinear_loop = model.before_nonlinear_loop
+    after_nonlinear_iteration = model.after_nonlinear_iteration
+
+    def stored() -> dict[tuple[int, str], np.ndarray]:
+        return {
+            (index, key): grid_data[pp.PARAMETERS][key]["darcy_flux"].copy()
+            for index, grid_data in enumerate(data)
+            for key in keys
+        }
+
+    def contradicted(current: dict, held: dict) -> int:
+        # Every key stores the same fluxes, so the first one is counted.
+        return sum(
+            int(np.count_nonzero(np.sign(current[(i, keys[0])]) != np.sign(fluxes)))
+            for (i, key), fluxes in held.items()
+            if key == keys[0]
+        )
+
+    def write(entry: dict[str, Any]) -> None:
+        with path.open("a") as file:
+            file.write(json.dumps(entry) + "\n")
+
+    def held_update_flux_values() -> None:
+        update_flux_values()
+        if state["iteration"] < after:
+            return
+        current = stored()
+        if state["held"] is None:
+            state["held"] = current
+            return
+        for (index, key), fluxes in state["held"].items():
+            data[index][pp.PARAMETERS][key]["darcy_flux"] = fluxes.copy()
+        write(
+            {
+                "time": model.time_manager.time,
+                "dt": model.time_manager.dt,
+                "iteration": state["iteration"],
+                "contradicted": contradicted(current, state["held"]),
+                "held": sum(
+                    f.size for (_, k), f in state["held"].items() if k == keys[0]
+                ),
+            }
+        )
+
+    def counted_before_nonlinear_loop() -> None:
+        state["iteration"], state["held"] = 0, None
+        before_nonlinear_loop()
+
+    def counted_after_nonlinear_iteration(*args, **kwargs) -> None:
+        state["iteration"] += 1
+        after_nonlinear_iteration(*args, **kwargs)
+
+    model.update_flux_values = held_update_flux_values
+    model.before_nonlinear_loop = counted_before_nonlinear_loop
+    model.after_nonlinear_iteration = counted_after_nonlinear_iteration
 
 
 def _end_wells_at_first_fracture(model, names: list[str]) -> None:
@@ -1445,6 +1535,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--state-without-wells", type=Path)
     parser.add_argument("--save-state-at-days", type=float, nargs="+")
     parser.add_argument("--restart-from", type=Path)
+    parser.add_argument("--freeze-well-upwind-after", type=int)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -1478,6 +1569,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         restart_from=None
         if arguments.restart_from is None
         else arguments.restart_from.resolve(),
+        freeze_well_upwind_after=arguments.freeze_well_upwind_after,
     )
     return variant, arguments.directory.resolve()
 
