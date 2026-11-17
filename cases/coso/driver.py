@@ -137,6 +137,9 @@ class Variant:
         freeze_well_upwind_after: Newton iteration of each main-run attempt after
             which the upwind directions in the wells and their interfaces stop being
             updated (see :func:`_freeze_well_upwind`). None updates them as usual.
+        chop_well_temperature: Largest change of temperature, in K, that one Newton
+            iteration of the main run may make in a well or junction cell (see
+            :func:`_chop_well_temperature`). None leaves the increments as they are.
 
     """
 
@@ -162,6 +165,7 @@ class Variant:
     save_state_at: list[float] | None = None
     restart_from: Path | None = None
     freeze_well_upwind_after: int | None = None
+    chop_well_temperature: float | None = None
 
 
 @dataclass
@@ -415,6 +419,13 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
                     model,
                     variant.freeze_well_upwind_after,
                     directory / "frozen_upwind.jsonl",
+                )
+            if variant.chop_well_temperature is not None:
+                _chop_well_temperature(
+                    self.solver,
+                    model,
+                    variant.chop_well_temperature,
+                    directory / "chopped_temperature.jsonl",
                 )
             instrument_assembly(model, self._timers)
             count_capped_dofs(self.solver, self._timers)
@@ -883,6 +894,58 @@ def _restore_well_ramp_caches(model) -> None:
         f"Restored the well ramp caches: flux {model._cached_well_top_flux}, "
         f"pressure {model._cached_well_top_pressure}."
     )
+
+
+def _chop_well_temperature(nonlinear_solver, model, limit: float, path: Path) -> None:
+    """Limit how far one Newton iteration moves the temperature in the wells.
+
+    Appleyard-style chopping: each well or junction cell whose temperature increment
+    exceeds ``limit`` (in K) in magnitude has it shortened to ``limit``, keeping its
+    sign; every other entry of the increment is left as it is. The chop is applied
+    before the variable bounds, and counts as capping, so an attempt is not accepted
+    on a chopped iteration. Each iteration writes to ``path`` how many cells were
+    chopped and the largest temperature change Newton asked for.
+
+    """
+    topology = find_well_topology(model)
+    if topology is None:
+        raise ValueError("The model has no wells whose temperatures could be chopped.")
+    equation_system = model.equation_system
+    limit_in_model_units = model.units.convert_units(limit, "K")
+    temperatures = equation_system.get_variables(
+        ["temperature"], topology.wells + topology.junctions
+    )
+    cap_increment_to_bounds = nonlinear_solver.cap_increment_to_bounds
+
+    def positions_in_increment() -> np.ndarray:
+        # The increment follows the global dof order, restricted to active dofs.
+        active_dofs = np.sort(
+            equation_system.dofs_of(nonlinear_solver.get_active_variables(model))
+        )
+        return np.searchsorted(active_dofs, equation_system.dofs_of(temperatures))
+
+    def chopped_then_capped(model, increment: np.ndarray) -> np.ndarray:
+        positions = positions_in_increment()
+        requested = increment[positions]
+        chopped = increment.copy()
+        chopped[positions] = np.clip(
+            requested, -limit_in_model_units, limit_in_model_units
+        )
+        with path.open("a") as file:
+            entry = {
+                "time": model.time_manager.time,
+                "dt": model.time_manager.dt,
+                "chopped": int(
+                    np.count_nonzero(np.abs(requested) > limit_in_model_units)
+                ),
+                "largest": float(np.abs(requested).max(initial=0.0))
+                / limit_in_model_units
+                * limit,
+            }
+            file.write(json.dumps(entry) + "\n")
+        return cap_increment_to_bounds(model, chopped)
+
+    nonlinear_solver.cap_increment_to_bounds = chopped_then_capped
 
 
 def _freeze_well_upwind(model, after: int, path: Path) -> None:
@@ -1536,6 +1599,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--save-state-at-days", type=float, nargs="+")
     parser.add_argument("--restart-from", type=Path)
     parser.add_argument("--freeze-well-upwind-after", type=int)
+    parser.add_argument("--chop-well-temperature", type=float)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -1570,6 +1634,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
         if arguments.restart_from is None
         else arguments.restart_from.resolve(),
         freeze_well_upwind_after=arguments.freeze_well_upwind_after,
+        chop_well_temperature=arguments.chop_well_temperature,
     )
     return variant, arguments.directory.resolve()
 
