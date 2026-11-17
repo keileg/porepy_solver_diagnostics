@@ -16,7 +16,8 @@ Each hook instruments the nonlinear solver the script built, the same way
 - assembly timing, for the main run.
 
 A variant can also swap the linear solver, switch on the temperature and pressure cap,
-stop the main run early, or stop after meshing. Nothing else about the script changes,
+stop the main run early, stop after meshing, or restart the main run from a saved
+state. Nothing else about the script changes,
 so a variant differs from the original by exactly the options it names.
 
 Example:
@@ -27,6 +28,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -127,6 +129,10 @@ class Variant:
             :func:`_start_from_state_without_wells`).
         save_state_at: Simulated times [s] of the main run at which to save the full
             model state, for a later run to restart from (see :class:`_SaveStateAt`).
+        restart_from: A ``state_<time>s.npz`` saved by an earlier run's
+            ``save_state_at``, to start the main run from at that time, skipping the
+            initialisation (see :func:`_resume_time_stepping_at` and
+            :func:`_start_from_saved_state`).
 
     """
 
@@ -150,6 +156,7 @@ class Variant:
     initialize_without_wells: bool = False
     state_without_wells: Path | None = None
     save_state_at: list[float] | None = None
+    restart_from: Path | None = None
 
 
 @dataclass
@@ -242,6 +249,8 @@ def run(variant: Variant, directory: Path) -> RunRecord:
     """
     tree = _snapshot_coso(directory)
     record = RunRecord(variant=asdict(variant))
+    if variant.restart_from is not None:
+        _resume_time_stepping_at(tree, _restart_point(variant.restart_from))
     _install_hooks(variant, directory, record)
     try:
         _execute(tree / f"{variant.script}.py", directory)
@@ -316,6 +325,10 @@ def _install_hooks(variant: Variant, directory: Path, record: RunRecord) -> None
             _leave_wells_out(model)
         if variant.state_without_wells is not None:
             _start_from_state_without_wells(model, variant.state_without_wells)
+            record.phases_done.append("initialization")
+            return model
+        if variant.restart_from is not None:
+            _start_from_saved_state(model, variant.restart_from)
             record.phases_done.append("initialization")
             return model
         if variant.steady_state is not None:
@@ -711,6 +724,153 @@ def _start_from_state_without_wells(model, path: Path) -> None:
     logger.info(
         f"Started from the well-free state {path}: {len(matches)} grids copied, "
         f"wells at their initial condition."
+    )
+
+
+def _restart_point(state: Path) -> dict[str, Any]:
+    """Time, dt and time index saved beside a state by :class:`_SaveStateAt`."""
+    return json.loads(state.with_suffix(".json").read_text())
+
+
+def _resume_time_stepping_at(tree: Path, restart: dict[str, Any]) -> None:
+    """Make the script's main time stepper start at a saved time, with the saved dt.
+
+    The scheduler starts at the first point of its schedule, whatever the model's
+    time, so the schedule is cut at the saved time, as Coso's own restart
+    (``RESTART_FROM_CRASH`` in ``run_example_3.py``) does. The saved time must be a
+    schedule point: each interval's largest step is half its length, so cutting an
+    interval would change the steps taken after the restart.
+
+    """
+    sys.path.insert(0, str(tree))
+    time_stepping = importlib.import_module("time_stepping")
+    build = time_stepping.time_steppers_coso
+
+    def resumed(schedule, *args, is_transition=None, interval_names=None, **kwargs):
+        (points,) = np.nonzero(
+            np.isclose(schedule, restart["time"], rtol=1e-12, atol=0.0)
+        )
+        if points.size != 1:
+            raise ValueError(
+                f"The restart time {restart['time']} s is not a schedule point."
+            )
+        first = int(points[0])
+        time_stepper, initialization_stepper = build(
+            schedule[first:],
+            *args,
+            is_transition=None if is_transition is None else is_transition[first:],
+            interval_names=None if interval_names is None else interval_names[first:],
+            **{**kwargs, "dt_start_first": restart["dt"]},
+        )
+        time_stepper.time_manager.time_index = restart["time_index"]
+        return time_stepper, initialization_stepper
+
+    time_stepping.time_steppers_coso = resumed
+
+
+def _start_from_saved_state(model, path: Path) -> None:
+    """Prepare the model and load a state saved by :class:`_SaveStateAt`.
+
+    The saved state holds the reference values set at the start of the original main
+    run, so the reference state is that run's, not the restart's. The restored state
+    is exported, as the initialisation pipeline exports its initial state.
+
+    """
+    restart = _restart_point(path)
+    if not np.isclose(model.time_manager.time, restart["time"], rtol=1e-12, atol=0):
+        raise ValueError(
+            f"The main time stepper starts at {model.time_manager.time} s, not at the "
+            f"restart time {restart['time']} s; the script builds it otherwise than "
+            "with time_steppers_coso."
+        )
+    times_to_export = model.params.get("times_to_export", None)
+    model.params["times_to_export"] = []
+    model.prepare_simulation()
+    model.params["times_to_export"] = times_to_export
+    _load_state_after_time_steps(model, path)
+    _restore_well_ramp_caches(model)
+    model.save_data_time_step()
+    logger.info(
+        f"Restarted from {path} at t = {restart['time']} s, dt = {restart['dt']} s."
+    )
+
+
+def _load_state_after_time_steps(model, path: Path) -> None:
+    """Load a state saved after time steps into a model that has just been prepared.
+
+    The boundary values of the previous time step (index 1) differ between the two:
+    a prepared model holds some of them, the saved state the ones a model creates at
+    its first time step. These are loaded as saved and not compared. All other values
+    must be the same in both, with the same shapes, as the storage requires for
+    :meth:`ModelStateStorage.load_state`; reference values are not compared, since a
+    model allocates them on demand.
+
+    """
+    storage = ModelStateStorage(path)
+    with np.load(path) as archive:
+        arrays = {key: archive[key] for key in archive.files}
+    prepared = storage.capture_state(model)
+
+    def compared(key: str) -> bool:
+        grid_type, _, location, _, index = ModelStateStorage._key_to_tuple(key)
+        previous_boundary_value = (
+            grid_type == "bg" and location == pp.TIME_STEP_SOLUTIONS and index == 1
+        )
+        return location != pp.REFERENCE_SOLUTIONS and not previous_boundary_value
+
+    differing = {key for key in arrays.keys() ^ prepared.keys() if compared(key)}
+    if differing:
+        raise ValueError(f"The saved state and the model differ by {sorted(differing)}")
+    reshaped = [
+        key
+        for key in arrays.keys() & prepared.keys()
+        if arrays[key].shape != prepared[key].shape
+    ]
+    if reshaped:
+        raise ValueError(f"Saved values of another shape: {sorted(reshaped)}.")
+    if not all(np.all(np.isfinite(array)) for array in arrays.values()):
+        raise ValueError("The saved state has values that are not finite.")
+    storage.apply_state(model, arrays)
+
+
+def _restore_well_ramp_caches(model) -> None:
+    """Recompute the wellhead flux and pressure the well ramps start from.
+
+    The script's boundary conditions ramp each well's wellhead flux or pressure from a
+    value cached on the model object, refreshed from the converged state after every
+    time step outside a ramp (``after_nonlinear_convergence`` in Coso's
+    ``boundary_conditions.py``, mirrored here). The saved state does not hold these
+    caches; without them the ramps start from hydrostatic pressure and zero flux.
+    Recomputing them from the restored state gives the values the original run had,
+    since a restart time is a schedule point: either outside every ramp, so the
+    caches were refreshed there, or a ramp's end, after which the caches are refreshed
+    before they are used.
+
+    """
+    if float(model.params.get("well_transition_duration", 0.0)) <= 0.0:
+        return
+    model._cached_well_top_flux = {}
+    model._cached_well_top_pressure = {}
+    upwards = np.array([0.0, 0.0, 1.0])
+    for sd in model.mdg.subdomains(dim=1):
+        if not model.is_well_grid(sd):
+            continue
+        well = model.parent_well(sd)
+        if not (model.is_production_well(well) or model.is_injection_well(well)):
+            continue
+        face = model._top_face_index(sd)
+        if face is None:
+            continue
+        name = well.tags["well_name"]
+        flux = model.darcy_flux([sd]).value(model.equation_system)[face]
+        model._cached_well_top_flux[name] = float(
+            flux * (sd.face_normals[:, face] @ upwards)
+        )
+        pressure = model.pressure_trace([sd]).value(model.equation_system)[face]
+        model._cached_well_top_pressure[name] = float(pressure)
+    logger.info(
+        f"Restored the well ramp caches: flux {model._cached_well_top_flux}, "
+        f"pressure {model._cached_well_top_pressure}."
     )
 
 
@@ -1284,6 +1444,7 @@ def _parse_arguments() -> tuple[Variant, Path]:
     parser.add_argument("--initialize-without-wells", action="store_true")
     parser.add_argument("--state-without-wells", type=Path)
     parser.add_argument("--save-state-at-days", type=float, nargs="+")
+    parser.add_argument("--restart-from", type=Path)
     arguments = parser.parse_args()
     variant = Variant(
         script=arguments.script,
@@ -1314,6 +1475,9 @@ def _parse_arguments() -> tuple[Variant, Path]:
         save_state_at=None
         if arguments.save_state_at_days is None
         else [days * pp.DAY for days in arguments.save_state_at_days],
+        restart_from=None
+        if arguments.restart_from is None
+        else arguments.restart_from.resolve(),
     )
     return variant, arguments.directory.resolve()
 
