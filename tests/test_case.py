@@ -401,3 +401,18 @@ def test_well_depth_sets_where_the_wells_end(depth: float) -> None:
         assert np.allclose(b.pts[:2, 1], a.pts[:2, 1])
         assert np.isclose(b.pts[2, 1], -depth * 1e3)
         assert b.tags == a.tags
+
+
+def test_iteration_target_replaces_the_range_rule() -> None:
+    """With an iteration target, every interval's dt follows the scaled rule alone; a
+    failure means the shipped range rule would still act on the step size."""
+    from solver_experiments.case import _time_manager
+
+    params = {"time_manager": pp.TimeManager(schedule=[0, 1, 2], dt_init=0.5)}
+    time_manager = _time_manager(
+        SolverSpec(iteration_target=8), params, np.array([0.0, 10.0, 20.0])
+    )
+    for interval in time_manager.schedule.intervals:
+        (constraint,) = interval.constraints
+        assert isinstance(constraint, pp.time_stepper.ScaledTargetNonlinearIterations)
+        assert constraint.target_iterations == 8

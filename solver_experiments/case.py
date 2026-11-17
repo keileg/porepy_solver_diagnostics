@@ -188,6 +188,9 @@ class SolverSpec:
             temperature stay within :data:`ADMISSIBILITY_BOUNDS`. Without it, the
             bounds are only counted.
         telemetry_verbosity: 0 disables telemetry, 1 records the scalar fields.
+        iteration_target: Number of Newton iterations the time stepper aims at, with
+            dt scaled by the distance from it (``ScaledTargetNonlinearIterations``).
+            `None` keeps the shipped rule: a fixed factor outside 6-10 iterations.
 
     """
 
@@ -208,6 +211,7 @@ class SolverSpec:
     tangential_contact: str = "projection"
     cap_to_bounds: bool = False
     telemetry_verbosity: int = 1
+    iteration_target: int | None = None
     solver_options: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -373,7 +377,7 @@ def _time_manager(
     """Build the time manager for a given schedule, keeping the shipped adaptivity."""
     shipped = params["time_manager"]
     dt_max = max(pp.YEAR, shipped.dt_init) if solver.dt_max is None else solver.dt_max
-    return pp.TimeManager(
+    time_manager = pp.TimeManager(
         schedule=schedule,
         dt_init=min(shipped.dt_init, dt_max),
         constant_dt=False,
@@ -381,6 +385,15 @@ def _time_manager(
         iter_optimal_range=(6, 10),
         iter_relax_factors=(0.5, 1.8),
     )
+    if solver.iteration_target is not None:
+        # The retry factor stays the shipped one, so only the rule after convergence
+        # changes.
+        constraint = pp.time_stepper.ScaledTargetNonlinearIterations(
+            target_iterations=solver.iteration_target, retry_factor=0.5
+        )
+        for interval in time_manager.schedule.intervals:
+            interval.constraints = [constraint]
+    return time_manager
 
 
 def build_model(
