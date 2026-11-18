@@ -22,6 +22,7 @@ cannot drift away from what PorePy ships.
 | `solver_experiments/compare.py` | Metrics files → comparison table |
 | `scripts/run_case.py` | One run, configured from the command line |
 | `scripts/compare.py` | The table over a results directory |
+| `cases/coso/` | The Coso case: `driver.py` runs it with the harness's hooks; `analysis/` holds the scripts that read its well telemetry |
 | `results/` | One directory per run (not committed) |
 
 ## Running
